@@ -1,8 +1,4 @@
-ai/
 .agents/
-AGENTS.md
-CLAUDE.md
-CODEX.md
 build/
 install/
 log/

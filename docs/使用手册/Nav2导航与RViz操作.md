@@ -20,7 +20,7 @@
 按 `Ctrl+Alt+T` 打开终端，进入仓库根目录。路径不同的话，把示例路径改成你自己的路径：
 
 ~~~bash
-cd /home/nvidia/nav2.0
+cd /home/nvidia/l1_navigation
 ~~~
 
 复制下面整条命令运行：
@@ -60,7 +60,7 @@ cd /home/nvidia/nav2.0
 如果想确认导航程序是否在发布数据，按 `Ctrl+Alt+T` 再开一个终端，然后加载环境：
 
 ~~~bash
-cd /home/nvidia/nav2.0
+cd /home/nvidia/l1_navigation
 source /opt/ros/humble/setup.bash
 source install/setup.bash
 ros2 node list
@@ -75,7 +75,24 @@ ros2 topic hz /Odometry
 
 等到终端打印频率后，按 `Ctrl+C` 停止这项检查；这不会停止第一个终端里的导航。
 
-### 5. 真车运行
+### 5. 选择双轮或全向轮底盘
+
+启动脚本默认选择双轮（`two_wheel`）参数。若机器人使用全向轮，在 `start_nav2.sh` 或 `start_map_navigation.sh` 命令里加 `chassis_model:=omni`，脚本会选择对应的全向 Nav2 参数文件。`chassis_model` 负责选择运动模型；`enable_chassis` 是独立的 CAN 底盘启动开关。第一次验证软件链时仍应使用 `enable_chassis:=false`。
+
+无图导航，全向轮示例：
+
+~~~bash
+./tool/start_nav2.sh \
+  chassis_model:=omni \
+  config_file:=mid360.yaml \
+  sensor_height:=0.25 \
+  visualize:=true \
+  enable_chassis:=false
+~~~
+
+双轮底盘省略 `chassis_model` 即可，也可显式设置 `chassis_model:=two_wheel`。已有 PCD 地图时，全向轮示例见[已有地图导航](使用手册.md#map-navigation)。
+
+### 6. 真车运行
 
 只有负责硬件的人已经确认 CAN 接口处于启用状态、通信速率正确、急停能立即停车、速度标定正确，并且测试区域清空后，才可以把 `enable_chassis:=false` 改为 `enable_chassis:=true`。真车示例：
 
@@ -85,11 +102,11 @@ ros2 topic hz /Odometry
 
 脚本不会替你设置 CAN。CAN 检查失败时先停下处理接口，不要通过删除参数或绕过检查来继续。
 
-### 6. 停止
+### 7. 停止
 
 回到第一个终端按 `Ctrl+C`，等待启动脚本和节点退出，再启动建图或地图导航。
 
-### 7. 常见情况
+### 8. 常见情况
 
 - **RViz 没打开**：确认这台电脑有图形桌面，命令里的 `visualize:=true` 没有拼错；无显示器时改成 false。
 - **没有点云或里程计**：按[传感器处理流程](传感器建图与校准.md#sensor-check)检查雷达和网卡，不要先改 Nav2 参数。
@@ -113,7 +130,7 @@ RViz 的 map 坐标系、Nav2 Goal 工具、代价显示和诊断面板见[RViz 
 先检查地图文件：
 
 ~~~bash
-cd /home/nvidia/nav2.0
+cd /home/nvidia/l1_navigation
 ls -lh PCD/clean_map.pcd
 ~~~
 
@@ -131,7 +148,7 @@ ls -lh PCD/clean_map.pcd
   enable_chassis:=false
 ~~~
 
-这里的 `PCD/clean_map.pcd` 是从仓库根目录开始的相对路径。如果你的仓库不在 `/home/nvidia/nav2.0`，先按实际位置进入仓库目录再运行。
+这里的 `PCD/clean_map.pcd` 是从仓库根目录开始的相对路径。如果你的仓库不在 `/home/nvidia/l1_navigation`，先按实际位置进入仓库目录再运行。
 
 默认使用双轮配置。全向轮配置只需在启动参数中加入 `chassis_model:=omni`：
 

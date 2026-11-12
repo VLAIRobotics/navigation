@@ -27,7 +27,7 @@ public:
 
   static BT::PortsList providedPorts()
   {
-    return {BT::InputPort<bool>("success", true)};
+    return {BT::InputPort<bool>("success", true, "")};
   }
 
   BT::NodeStatus tick() override
@@ -57,8 +57,9 @@ public:
   static BT::PortsList providedPorts()
   {
     return {
-      BT::InputPort<bool>("check_path", false), BT::InputPort<bool>("check_goal", false),
-      BT::InputPort<bool>("allow_unknown", false),
+      BT::InputPort<bool>("check_path", false, ""),
+      BT::InputPort<bool>("check_goal", false, ""),
+      BT::InputPort<bool>("allow_unknown", false, ""),
       BT::InputPort<geometry_msgs::msg::PoseStamped>("goal"),
       BT::InputPort<nav_msgs::msg::Path>("path")};
   }
@@ -99,8 +100,8 @@ public:
     return {
       BT::InputPort<geometry_msgs::msg::PoseStamped>("goal"),
       BT::OutputPort<nav_msgs::msg::Path>("path"),
-      BT::InputPort<std::string>("mode", "success"),
-      BT::InputPort<std::string>("planner_id", "GridBased")};
+      BT::InputPort<std::string>("mode", "success", ""),
+      BT::InputPort<std::string>("planner_id", "GridBased", "")};
   }
 
   BT::NodeStatus tick() override

@@ -4,21 +4,40 @@
 
 ## 下载仓库
 
+如果代码已经在电脑上，并且仓库根目录包含 `src/`、`tool/` 和 `README.md`，不要重复克隆；按下方“编译与环境”步骤继续配置。
+
+如果还没有代码，并且你有仓库访问权限，在目标设备终端运行：
+
 ~~~bash
+cd /home/nvidia
 git clone https://github.com/VLAIRobotics/l1_navigation.git
-cd l1_navigation
+cd /home/nvidia/l1_navigation
 ~~~
+
+克隆后确认当前目录是仓库根目录，并且能看到 `src/`、`tool/`、`README.md`。
 
 完整安装、设备接入、建图与导航步骤见[使用手册（详细操作指南）](docs/使用手册/使用手册.md)。
 
 ## 编译与环境
 
-内存有限的开发板不要一次编译整个工作区或启用多个并行 worker，以免耗尽内存。首次使用按目标包逐步构建，命令和选择方式见[手册中的编译说明](docs/使用手册/环境准备与终端操作.md#build-memory)。
+首次配置按[环境准备与终端操作](docs/使用手册/环境准备与终端操作.md#install-build)安装 ROS 2 Humble、Livox SDK 2 和系统依赖。Jetson 上若出现 `fmt::v12`/spdlog 版本冲突，按手册安装与 fmt 匹配且启用 PIC 的 spdlog。退出 Conda 后，手册中的 `colcon_defaults.yaml` 配置会自动固定系统 Python、单 worker 和 spdlog 路径。
+
+内存有限的开发板不要一次编译整个工作区或启用多个并行 worker。完成手册中的一次性默认配置后，从仓库根目录逐步构建：
+
+```bash
+source /opt/ros/humble/setup.bash
+colcon build --packages-up-to fast_lio --cmake-clean-cache
+source install/setup.bash
+colcon build --packages-up-to bringup
+source install/setup.bash
+```
+
+首次使用完整命令、故障处理与各目标包说明见[手册中的编译说明](docs/使用手册/环境准备与终端操作.md#build-memory)。
 
 每个新终端都先加载环境：
 
 ```bash
-cd l1_navigation
+cd /home/nvidia/l1_navigation
 source /opt/ros/humble/setup.bash
 source install/setup.bash
 ```
@@ -34,6 +53,24 @@ source install/setup.bash
 这条链使用 `odom` 下的滚动代价地图，不加载静态地图。当前 launch 默认会启动底盘驱动，所以只查看数据时要明确传 `enable_chassis:=false`。无显示器时将 `visualize:=true` 改成 false。只有在 CAN 接口、速度标定和急停均已确认后，才设置 `enable_chassis:=true`。
 
 按 `Ctrl-C` 停止。
+
+## 选择双轮或全向轮底盘
+
+启动脚本默认使用双轮参数。全向轮底盘在命令中加入 `chassis_model:=omni`，脚本会加载对应的 Nav2 参数文件。`chassis_model` 只选择运动模型和参数；`enable_chassis` 单独控制是否启动真实 CAN 底盘。第一次检查链路时保持 `enable_chassis:=false`。
+
+无图导航，双轮（默认）：
+
+```bash
+./tool/start_nav2.sh chassis_model:=two_wheel config_file:=mid360.yaml sensor_height:=0.25 visualize:=true enable_chassis:=false
+```
+
+无图导航，全向轮：
+
+```bash
+./tool/start_nav2.sh chassis_model:=omni config_file:=mid360.yaml sensor_height:=0.25 visualize:=true enable_chassis:=false
+```
+
+已有 PCD 地图导航时，也可在 `./tool/start_map_navigation.sh` 命令中加入 `chassis_model:=omni`；省略该参数时使用双轮配置。实车移动前由硬件负责人确认底盘型号、CAN 接口、速度标定和急停。
 
 ## 建图并保存 PCD
 
