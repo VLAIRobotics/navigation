@@ -1,0 +1,32 @@
+# The launch argument `pcd_file` overrides target_clouds.
+target_clouds: "/path/to/map.pcd"
+target_source_mode: "pcd"
+
+# FAST-LIO publishes this deskewed cloud in the calibrated body frame.
+lidar_topic_name: "/cloud_registered_body_downsampled"
+imu_topic_name: "/livox/imu"
+gravity_alignment: false
+
+min_level_res: 1.0
+max_level: 6
+min_rpy: [-0.02, -0.02, 0.0]
+max_rpy: [0.02, 0.02, 6.28]
+score_threshold_percentage: 0.9
+tar_leaf_size: 0.1
+src_leaf_size: 2.0
+min_scan_range: 0.0
+max_scan_range: 100.0
+timeout_msec: 30000
+
+backend: "cpu"
+cpu_num_threads: 2
+
+auto_localize: true
+auto_localize_retry_sec: 0.5
+relocalization_status_topic_name: "/small_gicp/relocalization_status"
+
+tar_points_topic_name: "/bbs3d/target_points"
+src_points_on_global_pose_topic_name: "/bbs3d/aligned_source"
+global_pose_topic_name: "/bbs3d/global_pose"
+score_topic_name: "/bbs3d/score"
+time_topic_name: "/bbs3d/time"

@@ -1,0 +1,19 @@
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <PipelineSequence name="NavigateWithReplanning">
+      <GlobalPlanRetry goal="{goal}" planning_goal="{planning_goal}" path="{path}"
+        candidate_path="{candidate_path}" retry_hz="1.0">
+        <PathCollisionFree check_path="false" check_goal="false"
+          allow_unknown="false"/>
+        <ComputePathToPose goal="{planning_goal}" path="{candidate_path}" planner_id="GridBased"/>
+        <PathCollisionFree goal="{goal}" check_path="false" check_goal="true"
+          allow_unknown="false"/>
+      </GlobalPlanRetry>
+      <FollowPathRetry goal="{goal}" path="{path}">
+        <FollowPath path="{path}" controller_id="FollowPath"/>
+        <PathCollisionFree goal="{goal}" check_path="false" check_goal="true"
+          allow_unknown="false"/>
+      </FollowPathRetry>
+    </PipelineSequence>
+  </BehaviorTree>
+</root>

@@ -1,0 +1,25 @@
+uint8 WAITING_INITIAL_POSE=0
+uint8 MAP_LOADING=1
+uint8 VERIFYING=2
+uint8 LOCALIZED=3
+uint8 LOST=4
+
+std_msgs/Header header
+uint8 state
+bool valid
+bool degraded
+bool fastlio_healthy
+uint64 producer_session_id
+uint64 initialization_generation
+uint64 localization_epoch
+uint32 consecutive_successes
+uint32 num_inliers
+float32 inlier_ratio
+uint32 match_sectors
+float32 match_coverage_ratio
+bool multistart_consistent
+float64 geometry_rmse_m
+float64 geometry_p95_m
+float64 correction_translation
+float64 correction_rotation
+builtin_interfaces/Time last_success_time

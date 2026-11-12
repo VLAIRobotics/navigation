@@ -1,0 +1,74 @@
+/**:
+    ros__parameters:
+        feature_extract_enable: false
+        point_filter_num: 1
+        max_iteration: 3
+        filter_size_surf: 0.5
+        filter_size_map: 0.5
+        cube_side_length: 1000.0
+        runtime_pos_log_enable: false
+        map_file_path: "./test.pcd"
+
+        common:
+            lid_topic:  "/livox/lidar"
+            imu_topic:  "/livox/imu"
+            time_sync_en: false         # 使用 PTP 外部同步；必须先启动并稳定 PTP，再启动驱动和 FAST-LIO
+            time_offset_lidar_to_imu: 0.0 # Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init (can be found in README).
+                                        # This param will take effect no matter what time_sync_en is. So if the time offset is not known exactly, please set as 0.0
+
+        preprocess:
+            lidar_type: 1                # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR, 4 for any other pointcloud input
+            scan_line:  4
+            blind: 0.5
+            timestamp_unit: 3
+            scan_rate: 10
+
+        mapping:
+            acc_cov: 0.1
+            gyr_cov: 0.1
+            b_acc_cov: 0.0001
+            b_gyr_cov: 0.0001
+            fov_degree:    360.0
+            det_range:     100.0
+            body_to_base_roll: 0.004997
+            body_to_base_pitch: -0.420735
+            extrinsic_est_en:  false     # freeze the current extrinsic during normal operation
+            extrinsic_T: [ -0.011, -0.02329, 0.04412 ]
+            # MID360 internal LiDAR-to-IMU calibration.
+            extrinsic_R: [ 1., 0., 0.,
+                           0., 1., 0.,
+                           0., 0., 1. ]
+
+        publish:
+            path_en: true                # true: publish Path
+            effect_map_en: false         # true: publish Effects
+            map_en: true                 # true: publish Map cloud
+            scan_publish_en:  true       # false: close all the point cloud output
+            dense_publish_en: true       # required for lossless PCD export through static_map_filter
+            scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
+
+        pcd_save:
+            pcd_save_en: true
+            interval: -1                 # how many LiDAR frames saved in each pcd file; 
+                                        # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.
+
+        health:
+            # Scan rejection and time-axis reinitialization use separate gap thresholds.
+            # Ordinary gaps and queue overflow reject only their source scan. Recovery
+            # requires unique consecutive abnormal scans across both frame and time limits.
+            min_effective_points: 10
+            min_effective_ratio: 0.02
+            max_mean_residual: 0.15
+            max_translation_correction: 0.30
+            max_rotation_correction: 0.35
+            max_speed: 1.5
+            max_vertical_speed: 0.5
+            max_imu_gap: 0.10
+            max_lidar_gap: 0.50
+            reinit_imu_gap: 0.20
+            reinit_lidar_gap: 1.00
+            max_processing_lag: 0.60
+            max_consecutive_faults: 10
+            min_consecutive_fault_duration: 1.0
+            shutdown_on_fault: false
+            shutdown_on_relocalization_lock: true

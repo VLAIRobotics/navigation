@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<library path="nav2_terrain_layer">
+  <class type="nav2_terrain_layer::TerrainLayer"
+         base_class_type="nav2_costmap_2d::Layer">
+    <description>FastDEM slope, residual step and roughness costmap layer.</description>
+  </class>
+  <class type="nav2_terrain_layer::StaticTerrainLayer"
+         base_class_type="nav2_costmap_2d::Layer">
+    <description>Persistent map-frame slope, residual step and roughness costmap layer.</description>
+  </class>
+</library>

@@ -1,0 +1,50 @@
+topics:
+  input_scans: ["/test/ground"]
+  publish_rate: 10.0
+  post_process_rate: 10.0
+  max_map_age: 1.0
+  max_future_stamp_offset: 0.1
+
+tf:
+  base_frame: "base_link"
+  map_frame: "map"
+  max_wait_time: 0.1
+  max_stale_time: 0.1
+
+map:
+  width: 5.0
+  height: 5.0
+  resolution: 0.1
+
+point_filter:
+  z_min: -1.0
+  z_max: 1.0
+  range_min: 0.25
+  range_max: 10.0
+
+mapping:
+  mode: "local"
+  type: "kalman_filter"
+  max_timestamp_regression: 0.1
+
+sensor_model:
+  type: "constant"
+  constant:
+    uncertainty: 0.03
+
+raycasting:
+  enabled: false
+
+inpainting:
+  enabled: true
+  max_iterations: 3
+  min_valid_neighbors: 4
+  max_hole_cells: 9
+
+uncertainty_fusion:
+  enabled: false
+
+feature_extraction:
+  enabled: true
+  analysis_radius: 0.3
+  min_valid_neighbors: 4

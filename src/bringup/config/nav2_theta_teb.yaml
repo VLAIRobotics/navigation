@@ -1,0 +1,357 @@
+/**:
+  ros__parameters:
+    use_sim_time: false
+
+bt_navigator:
+  ros__parameters:
+    use_sim_time: false
+    bt_loop_duration: 50
+    global_frame: odom
+    robot_base_frame: base_link
+    odom_topic: /Odometry
+    default_nav_to_pose_bt_xml: "$(find-pkg-share bringup)/behavior_trees/navigate_to_pose_guarded_recovery.xml"
+    plugin_lib_names:
+      - bringup_goal_cost_condition_bt_node
+      - nav2_compute_path_to_pose_action_bt_node
+      - nav2_compute_path_through_poses_action_bt_node
+      - nav2_smooth_path_action_bt_node
+      - nav2_follow_path_action_bt_node
+      - nav2_spin_action_bt_node
+      - nav2_wait_action_bt_node
+      - nav2_assisted_teleop_action_bt_node
+      - nav2_back_up_action_bt_node
+      - nav2_drive_on_heading_bt_node
+      - nav2_clear_costmap_service_bt_node
+      - nav2_is_stuck_condition_bt_node
+      - nav2_goal_reached_condition_bt_node
+      - nav2_goal_updated_condition_bt_node
+      - nav2_globally_updated_goal_condition_bt_node
+      - nav2_is_path_valid_condition_bt_node
+      - nav2_initial_pose_received_condition_bt_node
+      - nav2_reinitialize_global_localization_service_bt_node
+      - nav2_rate_controller_bt_node
+      - nav2_distance_controller_bt_node
+      - nav2_speed_controller_bt_node
+      - nav2_truncate_path_action_bt_node
+      - nav2_truncate_path_local_action_bt_node
+      - nav2_goal_updater_node_bt_node
+      - nav2_recovery_node_bt_node
+      - nav2_pipeline_sequence_bt_node
+      - nav2_round_robin_node_bt_node
+      - nav2_transform_available_condition_bt_node
+      - nav2_time_expired_condition_bt_node
+      - nav2_path_expiring_timer_condition
+      - nav2_distance_traveled_condition_bt_node
+      - nav2_single_trigger_bt_node
+      - nav2_goal_updated_controller_bt_node
+      - nav2_is_battery_low_condition_bt_node
+      - nav2_navigate_to_pose_action_bt_node
+      - nav2_navigate_through_poses_action_bt_node
+      - nav2_remove_passed_goals_action_bt_node
+      - nav2_planner_selector_bt_node
+      - nav2_controller_selector_bt_node
+      - nav2_goal_checker_selector_bt_node
+      - nav2_controller_cancel_bt_node
+      - nav2_path_longer_on_approach_bt_node
+      - nav2_wait_cancel_bt_node
+      - nav2_spin_cancel_bt_node
+      - nav2_back_up_cancel_bt_node
+      - nav2_assisted_teleop_cancel_bt_node
+      - nav2_drive_on_heading_cancel_bt_node
+      - nav2_is_battery_charging_condition_bt_node
+
+controller_server:
+  ros__parameters:
+    use_sim_time: false
+    odom_topic: /Odometry
+    controller_frequency: 10.0
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.001
+    min_theta_velocity_threshold: 0.001
+    failure_tolerance: 0.3
+    progress_checker_plugin: "progress_checker"
+    goal_checker_plugins: ["goal_checker"]
+    controller_plugins: ["FollowPath"]
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      required_movement_radius: 0.15
+      movement_time_allowance: 10.0
+    goal_checker:
+      # 到达位置/姿态容差后，还必须确认底盘已经基本停止，避免带速判定成功后
+      # 由 velocity_smoother 的减速过程把机器人继续推过目标点。
+      plugin: "nav2_controller::StoppedGoalChecker"
+      xy_goal_tolerance: 0.20
+      yaw_goal_tolerance: 0.20
+      stateful: false
+      # 日志中的静止里程计噪声约为 0.02--0.03 m/s、0.006 rad/s；阈值留出
+      # 少量噪声余量，但不会把仍在明显运动的机器人当作已停止。
+      trans_stopped_velocity: 0.03
+      rot_stopped_velocity: 0.05
+    FollowPath:
+      plugin: "teb_local_planner::TebLocalPlannerROS"
+      odom_topic: /Odometry
+      teb_autosize: true
+      dt_ref: 0.3
+      dt_hysteresis: 0.1
+      max_samples: 500
+      no_inner_iterations: 4
+      no_outer_iterations: 3
+      global_plan_overwrite_orientation: false
+      allow_init_with_backwards_motion: false
+      global_plan_viapoint_sep: 0.3
+      via_points_ordered: true
+      max_global_plan_lookahead_dist: 2.5
+      feasibility_check_no_poses: 5
+      max_vel_x: 0.35
+      max_vel_x_backwards: 0.20
+      max_vel_theta: 0.30
+      acc_lim_x: 0.30
+      acc_lim_theta: 0.40
+      # 日志显示 TEB 在低速倒车/转向段无法克服底盘死区，随后出现大幅反向
+      # 偏航。提高前进代价权重，优先选择可控的前进轨迹。
+      weight_kinematics_forward_drive: 100.0
+      weight_viapoint: 10.0
+      weight_shortest_path: 2.0
+      enable_homotopy_class_planning: false
+      # min_obstacle_dist 同时是障碍关联半径基准：截断=5×该值，强制纳入=1.5×该值。
+      # 取值必须大于 costmap 分辨率 0.10，否则关联半径小于车体外接圆且余量落在量化噪声内。
+      min_obstacle_dist: 0.15
+      inflation_dist: 0.35
+      include_costmap_obstacles: true
+      costmap_obstacles_behind_robot_dist: 1.5
+      min_turning_radius: 0.0
+      wheelbase: 0.0
+      cmd_angle_instead_rotvel: false
+      footprint_model.type: "polygon"
+      footprint_model.vertices: "[[0.275, 0.225], [0.275, -0.225], [-0.35, -0.225], [-0.35, 0.225]]"
+      xy_goal_tolerance: 0.20
+      yaw_goal_tolerance: 0.20
+      free_goal_vel: false
+
+planner_server:
+  ros__parameters:
+    use_sim_time: false
+    expected_planner_frequency: 5.0
+    planner_plugins: ["GridBased"]
+    GridBased:
+      plugin: "nav2_theta_star_planner/ThetaStarPlanner"
+      how_many_corners: 8
+      w_euc_cost: 1.0
+      w_traversal_cost: 1.0
+      allow_unknown: false
+      start_unknown_escape_radius: 0.50
+      use_final_approach_orientation: false
+      path_hysteresis_ratio: 0.30  # 旧路径仍可通行且明显更差时才切换，抑制软代价变化引起的换边
+      path_hysteresis_max_rejoin_distance: 0.30  # 机器人离旧路径超过该值时采用新规划
+
+smoother_server:
+  ros__parameters:
+    use_sim_time: false
+    smoother_plugins: ["simple_smoother"]
+    simple_smoother:
+      plugin: "nav2_smoother::SimpleSmoother"
+      tolerance: 1.0e-10
+      max_its: 1000
+      do_refinement: true
+
+behavior_server:
+  ros__parameters:
+    use_sim_time: false
+    global_frame: odom
+    robot_base_frame: base_link
+    cycle_frequency: 10.0
+    behavior_plugins: ["spin", "backup", "drive_on_heading", "wait"]
+    spin:
+      plugin: "nav2_behaviors/Spin"
+    simulate_ahead_time: 3.0
+    max_rotational_vel: 0.30
+    min_rotational_vel: 0.10
+    rotational_acc_lim: 0.40
+    backup:
+      plugin: "nav2_behaviors/BackUp"
+    drive_on_heading:
+      plugin: "nav2_behaviors/DriveOnHeading"
+    wait:
+      plugin: "nav2_behaviors/Wait"
+    costmap_topic: local_costmap/costmap_raw
+    footprint_topic: local_costmap/published_footprint
+    transform_tolerance: 0.1
+
+waypoint_follower:
+  ros__parameters:
+    use_sim_time: false
+    loop_rate: 20
+    stop_on_failure: false
+    waypoint_task_executor_plugin: wait_at_waypoint
+    wait_at_waypoint:
+      plugin: "nav2_waypoint_follower::WaitAtWaypoint"
+      enabled: false
+      waypoint_pause_duration: 0
+
+velocity_smoother:
+  ros__parameters:
+    use_sim_time: false
+    smoothing_frequency: 20.0
+    scale_velocities: false
+    feedback: "OPEN_LOOP"
+    max_velocity: [0.35, 0.0, 0.30]
+    min_velocity: [-0.20, 0.0, -0.30]
+    max_accel: [0.30, 0.0, 0.40]
+    max_decel: [-0.50, 0.0, -0.60]
+    odom_topic: /Odometry
+    odom_duration: 0.1
+    deadband_velocity: [0.0, 0.0, 0.0]
+    velocity_timeout: 1.0
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      use_sim_time: false
+      global_frame: odom
+      robot_base_frame: base_link
+      update_frequency: 5.0
+      publish_frequency: 1.0
+      rolling_window: true
+      width: 15
+      height: 15
+      resolution: 0.10
+      footprint: "[[0.275, 0.225], [0.275, -0.225], [-0.35, -0.225], [-0.35, 0.225]]"
+      footprint_padding: 0.01
+      track_unknown_space: true
+      always_send_full_costmap: false
+      plugins: ["temporal_obstacle_layer", "obstacle_layer", "terrain_layer", "inflation_layer"]
+      temporal_obstacle_layer:
+        plugin: "bringup::TemporalObstacleLayer"
+        enabled: true
+        observation_topic: /obstacles/global_costmap_updates
+        point_retention: 1.0
+        observation_timeout: 1.0
+        future_tolerance: 0.1
+        footprint_clearing_enabled: true
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        combination_method: 1
+        observation_sources: registered_points
+        registered_points:
+          topic: /cloud_registered_body
+          data_type: PointCloud2
+          marking: false
+          clearing: true
+          raytrace_min_range: 0.1
+          # Cover the 15 m rolling square through its 10.61 m corners.
+          raytrace_max_range: 11.0
+          min_obstacle_height: -2.0
+          max_obstacle_height: 2.0
+      terrain_layer:
+        plugin: "nav2_terrain_layer::TerrainLayer"
+        enabled: true
+        gridmap_topic: /fastdem/postprocess/gridmap
+        terrain_status_topic: /fastdem/global_terrain_valid
+        global_frame: odom
+        map_timeout: 1.5
+        slope_soft_threshold: 5.0
+        slope_lethal_threshold: 10.0
+        slope_hard_constraint: false
+        residual_step_soft_threshold: 0.02
+        residual_step_lethal_threshold: 0.05
+        residual_step_hard_constraint: true
+        roughness_soft_threshold: 0.03
+        roughness_lethal_threshold: 0.10
+        roughness_hard_constraint: false
+        min_observations: 3
+        max_observation_age_frames: 3
+        lethal_confirmation_frames: 3
+        lethal_confirmation_window_frames: 5
+        lethal_clear_frames: 2
+        lethal_max_age: 2.0
+        min_confident_cells: 20
+        max_lethal_fraction: 0.90
+        max_future_stamp_offset: 0.1
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        # 半径覆盖 footprint 外接范围，保留软代价梯度，减少 Theta* 在 253 边界切换。
+        cost_scaling_factor: 8.0
+        inflation_radius: 0.56
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      use_sim_time: false
+      global_frame: odom
+      robot_base_frame: base_link
+      update_frequency: 10.0
+      publish_frequency: 5.0
+      rolling_window: true
+      width: 6
+      height: 6
+      resolution: 0.10
+      footprint: "[[0.275, 0.225], [0.275, -0.225], [-0.35, -0.225], [-0.35, 0.225]]"
+      footprint_padding: 0.01
+      track_unknown_space: false
+      always_send_full_costmap: false
+      plugins: ["temporal_obstacle_layer", "obstacle_layer", "terrain_layer", "inflation_layer"]
+      temporal_obstacle_layer:
+        plugin: "bringup::TemporalObstacleLayer"
+        enabled: true
+        observation_topic: /obstacles/blocking
+        point_retention: 1.0
+        observation_timeout: 1.0
+        future_tolerance: 0.1
+        footprint_clearing_enabled: true
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        combination_method: 1
+        observation_sources: registered_points
+        registered_points:
+          topic: /cloud_registered_body
+          data_type: PointCloud2
+          marking: false
+          clearing: true
+          raytrace_min_range: 0.1
+          raytrace_max_range: 5.0
+          min_obstacle_height: -2.0
+          max_obstacle_height: 2.0
+      terrain_layer:
+        plugin: "nav2_terrain_layer::TerrainLayer"
+        enabled: true
+        gridmap_topic: /fastdem/postprocess/gridmap
+        terrain_status_topic: /fastdem/local_terrain_valid
+        global_frame: odom
+        map_timeout: 1.5
+        slope_soft_threshold: 5.0
+        slope_lethal_threshold: 10.0
+        slope_hard_constraint: false
+        residual_step_soft_threshold: 0.02
+        residual_step_lethal_threshold: 0.05
+        residual_step_hard_constraint: true
+        roughness_soft_threshold: 0.03
+        roughness_lethal_threshold: 0.10
+        roughness_hard_constraint: false
+        min_observations: 3
+        max_observation_age_frames: 3
+        lethal_confirmation_frames: 3
+        lethal_confirmation_window_frames: 5
+        lethal_clear_frames: 2
+        lethal_max_age: 2.0
+        min_confident_cells: 20
+        max_lethal_fraction: 0.90
+        max_future_stamp_offset: 0.1
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 8.0
+        inflation_radius: 0.25
+
+lifecycle_manager_navigation:
+  ros__parameters:
+    use_sim_time: false
+    autostart: true
+    node_names:
+      - controller_server
+      - smoother_server
+      - planner_server
+      - behavior_server
+      - bt_navigator
+      - waypoint_follower
+      - velocity_smoother

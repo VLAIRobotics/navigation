@@ -1,0 +1,7 @@
+uint64 gate_session_id
+uint64 handoff_session_id
+uint64 request_id
+uint64 producer_session_id
+uint64 initialization_generation
+uint64 localization_epoch
+bool confirmed

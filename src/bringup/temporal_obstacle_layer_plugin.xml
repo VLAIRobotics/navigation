@@ -1,0 +1,7 @@
+<?xml version="1.0"?>
+<library path="bringup_temporal_obstacle_layer">
+  <class type="bringup::TemporalObstacleLayer"
+         base_class_type="nav2_costmap_2d::Layer">
+    <description>Short-lived local obstacle snapshot layer.</description>
+  </class>
+</library>

@@ -1,0 +1,4 @@
+geometry_msgs/TransformStamped transform
+uint64 producer_session_id
+uint64 initialization_generation
+uint64 localization_epoch

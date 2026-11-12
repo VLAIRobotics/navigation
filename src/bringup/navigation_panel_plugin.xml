@@ -1,0 +1,5 @@
+<library path="navigation_status_panel">
+  <class name="bringup/NavigationStatus" type="bringup::NavigationStatusPanel" base_class_type="rviz_common::Panel">
+    <description>Navigation readiness, live obstacle freshness and planner diagnostics.</description>
+  </class>
+</library>

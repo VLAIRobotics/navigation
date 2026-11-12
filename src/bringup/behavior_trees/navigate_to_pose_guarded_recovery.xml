@@ -1,0 +1,51 @@
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="3" name="NavigateRecovery">
+      <PipelineSequence name="NavigateWithReplanning">
+        <RateController hz="0.5">
+          <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+        </RateController>
+        <RecoveryNode number_of_retries="1" name="FollowPath">
+          <FollowPath path="{path}" controller_id="FollowPath"/>
+          <ReactiveSequence name="GuardedFollowPathRecovery">
+            <GoalCostSafe goal="{goal}" costmap_topic="/global_costmap/costmap"
+              max_cost_exclusive="254" require_new_snapshot="false"/>
+            <Sequence name="ClearLocalCostmapAfterFreshGoalCheck">
+              <GoalCostSafe goal="{goal}" costmap_topic="/global_costmap/costmap"
+                max_cost_exclusive="254" require_new_snapshot="true"/>
+              <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap"/>
+            </Sequence>
+          </ReactiveSequence>
+        </RecoveryNode>
+      </PipelineSequence>
+      <ReactiveFallback name="RecoveryFallback">
+        <GoalUpdated/>
+        <ReactiveSequence name="RecoveryForNonlethalGoal">
+          <GoalCostSafe goal="{goal}" costmap_topic="/global_costmap/costmap"
+            max_cost_exclusive="254" allow_unknown="true" require_new_snapshot="false"/>
+          <RoundRobin name="RecoveryActions">
+            <BackUp backup_dist="0.20" backup_speed="0.08" time_allowance="8"/>
+            <Sequence name="ClearingActionsForSafeGoal">
+              <GoalCostSafe goal="{goal}" costmap_topic="/global_costmap/costmap"
+                max_cost_exclusive="254" allow_unknown="true" require_new_snapshot="true"/>
+              <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
+              <GoalCostSafe goal="{goal}" costmap_topic="/global_costmap/costmap"
+                max_cost_exclusive="254" allow_unknown="true" require_new_snapshot="true"/>
+              <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
+            </Sequence>
+            <Sequence name="SpinForSafeGoal">
+              <GoalCostSafe goal="{goal}" costmap_topic="/global_costmap/costmap"
+                max_cost_exclusive="254" allow_unknown="true" require_new_snapshot="true"/>
+              <Spin spin_dist="1.0"/>
+            </Sequence>
+            <Sequence name="WaitForSafeGoal">
+              <GoalCostSafe goal="{goal}" costmap_topic="/global_costmap/costmap"
+                max_cost_exclusive="254" allow_unknown="true" require_new_snapshot="true"/>
+              <Wait wait_duration="2"/>
+            </Sequence>
+          </RoundRobin>
+        </ReactiveSequence>
+      </ReactiveFallback>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>

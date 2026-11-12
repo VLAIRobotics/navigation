@@ -1,0 +1,97 @@
+# FastDEM ROS Configuration (adapted for FAST-LIO + Patchwork++)
+topics:
+  input_scans: ["/patchworkpp/ground"]  # 只吃地面点，出纯地形高程
+  publish_rate: 10.0        # [Hz]
+  post_process_rate: 5.0    # [Hz] 0 = service-only (no auto timer)
+  max_map_age: 1.0          # [sec] expire synthetic terrain early; consumers reject after 1.5 s, leaving 0.5 s transport margin
+  max_future_stamp_offset: 0.1  # [sec] allowed source clock lead
+
+tf:
+  base_frame: "base_link"
+  map_frame: "odom"
+  max_wait_time: 0.1   # [sec]
+  max_stale_time: 0.1  # [sec]
+
+map:
+  width: 15.0       # [m]
+  height: 15.0      # [m]
+  resolution: 0.1   # [m/cell]
+
+point_filter:
+  z_min: -2.0       # [m] min height in base frame
+  z_max: 2.0        # [m] max height in base frame
+  range_min: 0.25   # [m] 3D sensor-frame range; diagnostic XY range is reported separately
+  range_max: 30.0   # [m] max range from sensor
+
+logger:
+  level: "info"  # info, warn, error, debug
+
+# --- Mapping Pipeline ---
+mapping:
+  mode: "local"                # local | global
+  type: "kalman_filter"        # kalman_filter | p2_quantile
+  max_timestamp_regression: 0.1  # [sec] bounded multi-sensor reordering
+  kalman:
+    min_variance: 0.0001     # [m2]
+    max_variance: 0.01       # [m2]
+    process_noise: 0.0       # [m2]
+  p2:
+    dn0: 0.0
+    dn1: 0.16
+    dn2: 0.50
+    dn3: 0.84
+    dn4: 1.0
+    elevation_marker: 3
+    max_sample_count: 0
+
+sensor_model:
+  type: "lidar"              # lidar | rgbd | constant
+  lidar:
+    range_noise: 0.02        # [m] sigma_r
+    angular_noise: 0.001     # [rad] sigma_theta
+  rgbd:
+    normal_a: 0.001          # [m] base depth noise
+    normal_b: 0.002          # [m^-1] quadratic coefficient
+    normal_c: 0.4            # [m] optimal depth
+    lateral_factor: 0.001    # lateral noise factor
+  constant:
+    uncertainty: 0.03        # [m] sigma
+
+# --- Post-processing ---
+raycasting:
+  enabled: true
+  height_conflict_threshold: 0.05  # [m]
+  log_odds_observed: 0.4
+  log_odds_ghost: 0.2
+  log_odds_max: 2.0
+  clear_threshold: -1.0
+
+inpainting:
+  enabled: true
+  max_iterations: 3         # original-sample support radius [cells]
+  min_valid_neighbors: 4
+  max_hole_cells: 9         # only enclosed components up to this size
+
+uncertainty_fusion:
+  enabled: false
+  search_radius: 0.15       # [m]
+  spatial_sigma: 0.05        # [m]
+  quantile_lower: 0.01
+  quantile_upper: 0.99
+  min_valid_neighbors: 3
+
+feature_extraction:
+  enabled: true
+  analysis_radius: 0.6       # [m]
+  min_valid_neighbors: 40    # 0.6m 核约 113 格；低支撑度下百分位退化成 max-min，不抗离群
+  min_observations: 3        # 与 Nav2 terrain_layer 一致，过滤中心及邻域
+  max_observation_age_frames: 3
+  step_lower_percentile: 0.10
+  step_upper_percentile: 0.90
+
+# --- Visualization ---
+visualization:
+  feature_extraction:
+    normals:
+      arrow_length: 0.15    # [m] normal vector line length
+      stride: 1             # cell stride (1=all, 2=every 2nd, ...)
