@@ -57,7 +57,26 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /small_gicp/pose
-      Value: false
+      Value: true
+    - Alpha: 0.9
+      Axes Length: 0.6
+      Axes Radius: 0.035
+      Class: rviz_default_plugins/Pose
+      Color: 255; 170; 30
+      Enabled: true
+      Head Length: 0.22
+      Head Radius: 0.07
+      Name: Unverified GICP Candidate
+      Shaft Length: 0.5
+      Shaft Radius: 0.035
+      Shape: Arrow
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /small_gicp/candidate_pose
+      Value: true
     - Alpha: 1
       Autocompute Value Bounds:
         Max Value: 1
@@ -156,7 +175,7 @@ Visualization Manager:
       Color: 200; 200; 200
       Color Layer: display_relief
       Color Transformer: GridMapLayer
-      Enabled: false
+      Enabled: true
       Height Layer: display_elevation
       Height Transformer: GridMapLayer
       History Length: 1
@@ -174,13 +193,13 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /terrain_map/static
       Use Rainbow: false
-      Value: false
+      Value: true
     - Alpha: 0.85
       Class: grid_map_rviz_plugin/GridMap
       Color: 255; 255; 255
       Color Layer: elevation
       Color Transformer: GridMapLayer
-      Enabled: false
+      Enabled: true
       Height Layer: elevation
       Height Transformer: GridMapLayer
       History Length: 1
@@ -242,7 +261,7 @@ Visualization Manager:
     - Alpha: 1
       Class: rviz_default_plugins/Polygon
       Color: 255; 60; 40
-      Enabled: false
+      Enabled: true
       Name: Planner Footprint
       Topic:
         Depth: 5
@@ -250,7 +269,7 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /global_costmap/published_footprint
-      Value: false
+      Value: true
     - Alpha: 0.45
       Class: rviz_default_plugins/Map
       Color Scheme: costmap

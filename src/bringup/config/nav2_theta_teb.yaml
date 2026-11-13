@@ -104,8 +104,10 @@ controller_server:
       feasibility_check_no_poses: 5
       max_vel_x: 0.35
       max_vel_x_backwards: 0.20
+      max_vel_y: 0.0
       max_vel_theta: 0.30
       acc_lim_x: 0.30
+      acc_lim_y: 0.0
       acc_lim_theta: 0.40
       # 日志显示 TEB 在低速倒车/转向段无法克服底盘死区，随后出现大幅反向
       # 偏航。提高前进代价权重，优先选择可控的前进轨迹。

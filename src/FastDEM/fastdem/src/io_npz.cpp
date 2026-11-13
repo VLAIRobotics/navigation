@@ -14,13 +14,16 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace fastdem {
@@ -253,6 +256,34 @@ bool jsonFloat(const std::string& json, const std::string& key, float& out) {
   return true;
 }
 
+size_t jsonFieldColon(const std::string& json, const std::string& key) {
+  auto pos = json.find("\"" + key + "\"");
+  while (pos != std::string::npos) {
+    auto after_key = json.find_first_not_of(" \t\r\n", pos + key.size() + 2);
+    if (after_key != std::string::npos && json[after_key] == ':') {
+      return after_key;
+    }
+    pos = json.find("\"" + key + "\"", pos + key.size() + 2);
+  }
+  return std::string::npos;
+}
+
+bool jsonDouble(const std::string& json, const std::string& key, double& out) {
+  const auto colon = jsonFieldColon(json, key);
+  if (colon == std::string::npos) return false;
+  const auto pos = json.find_first_not_of(" \t\r\n", colon + 1);
+  if (pos == std::string::npos) return false;
+  try {
+    size_t consumed = 0;
+    out = std::stod(json.substr(pos), &consumed);
+    if (consumed == 0) return false;
+    const auto next = json.find_first_not_of(" \t\r\n", pos + consumed);
+    return next == std::string::npos || json[next] == ',' || json[next] == '}';
+  } catch (const std::exception&) {
+    return false;
+  }
+}
+
 // Extract two ints from "key": [a, b].
 bool jsonIntPair(const std::string& json, const std::string& key, int& a,
                  int& b) {
@@ -317,6 +348,8 @@ struct NpyInfo {
   int cols = 0;
   bool is_float_array = false;  // '<f4' with shape (r,c)
   bool is_string = false;       // '|S...' with shape ()
+  bool is_fortran_order = false;
+  bool is_scalar_string = false;
   size_t string_len = 0;
   size_t data_offset = 0;  // offset to data within .npy blob
 };
@@ -343,6 +376,7 @@ bool parseNpyHeader(const char* buf, size_t buf_size, NpyInfo& info) {
 
   if (dict.find("'<f4'") != std::string::npos) {
     info.is_float_array = true;
+    info.is_fortran_order = dict.find("'fortran_order': True") != std::string::npos;
     // Parse shape: (rows, cols)
     auto shape_pos = dict.find("'shape'");
     if (shape_pos == std::string::npos) return false;
@@ -353,19 +387,28 @@ bool parseNpyHeader(const char* buf, size_t buf_size, NpyInfo& info) {
     std::string shape_str = dict.substr(paren + 1, paren_end - paren - 1);
     auto comma = shape_str.find(',');
     if (comma == std::string::npos) return false;
-    info.rows = std::stoi(shape_str.substr(0, comma));
-    std::string cols_str = shape_str.substr(comma + 1);
-    // Handle trailing comma: "(200, 100, )"
-    if (!cols_str.empty() && cols_str.back() == ',') cols_str.pop_back();
-    while (!cols_str.empty() && cols_str.front() == ' ') cols_str.erase(0, 1);
-    if (cols_str.empty()) return false;
-    info.cols = std::stoi(cols_str);
+    try {
+      info.rows = std::stoi(shape_str.substr(0, comma));
+      std::string cols_str = shape_str.substr(comma + 1);
+      // Handle trailing comma: "(200, 100, )"
+      if (!cols_str.empty() && cols_str.back() == ',') cols_str.pop_back();
+      while (!cols_str.empty() && cols_str.front() == ' ') cols_str.erase(0, 1);
+      if (cols_str.empty()) return false;
+      info.cols = std::stoi(cols_str);
+    } catch (const std::exception&) {
+      return false;
+    }
   } else if (dict.find("'|S") != std::string::npos) {
     info.is_string = true;
+    info.is_scalar_string = dict.find("'shape': ()") != std::string::npos;
     auto s_pos = dict.find("'|S");
     auto s_end = dict.find('\'', s_pos + 3);
     if (s_end == std::string::npos) return false;
-    info.string_len = std::stoul(dict.substr(s_pos + 3, s_end - s_pos - 3));
+    try {
+      info.string_len = std::stoul(dict.substr(s_pos + 3, s_end - s_pos - 3));
+    } catch (const std::exception&) {
+      return false;
+    }
   } else {
     return false;
   }
@@ -441,10 +484,21 @@ bool saveNpz(const std::string& filename, const ElevationMap& map,
 // ─── Load ───────────────────────────────────────────────────────────────────
 
 bool loadNpz(const std::string& filename, ElevationMap& map) {
+  return loadNpz(filename, map, nullptr);
+}
+
+bool loadNpz(const std::string& filename, ElevationMap& map,
+             std::string* error) {
+  if (error != nullptr) error->clear();
+  const auto fail = [error](const std::string& message) {
+    if (error != nullptr) *error = message;
+    spdlog::error("[npz_io] {}", message);
+    return false;
+  };
+
   std::ifstream fs(filename, std::ios::binary);
   if (!fs.is_open()) {
-    spdlog::error("[npz_io] Cannot open {}", filename);
-    return false;
+    return fail("cannot open NPZ: " + filename);
   }
 
   // Collect entries by reading local file headers sequentially
@@ -458,46 +512,51 @@ bool loadNpz(const std::string& filename, ElevationMap& map) {
   constexpr uint32_t kLocalSig = 0x04034b50;
   constexpr uint32_t kMaxEntries = 1000;
   constexpr uint32_t kMaxEntrySize = 400'000'000;  // 400MB
+  constexpr size_t kMaxMapCells = kMaxEntrySize / sizeof(float);
 
   while (entries.size() < kMaxEntries) {
     uint32_t sig = detail::readLE32(fs);
     if (fs.fail() || sig != kLocalSig) break;
 
-    // Skip: version(2), flags(2), compression(2), time(2), date(2), crc(4)
-    fs.ignore(14);
-    // compressed_size == uncompressed_size (STORE)
-    /*uint32_t compressed_size =*/detail::readLE32(fs);
+    fs.ignore(2);  // version needed
+    const uint16_t flags = detail::readLE16(fs);
+    const uint16_t compression = detail::readLE16(fs);
+    fs.ignore(8);  // time, date, crc32
+    const uint32_t compressed_size = detail::readLE32(fs);
     uint32_t uncompressed_size = detail::readLE32(fs);
     uint16_t name_len = detail::readLE16(fs);
     uint16_t extra_len = detail::readLE16(fs);
     if (fs.fail()) break;
 
-    // Validate
-    if (name_len > 4096 || uncompressed_size > kMaxEntrySize) {
-      spdlog::error("[npz_io] Invalid entry (name_len={}, size={})", name_len,
-                    uncompressed_size);
-      return false;
+    if (flags != 0 || compression != 0 || compressed_size != uncompressed_size) {
+      return fail("NPZ entries must be unencrypted and stored without compression");
+    }
+    if (name_len == 0 || name_len > 4096 || uncompressed_size > kMaxEntrySize) {
+      return fail("NPZ entry has an invalid name or exceeds the 400 MB limit");
     }
 
-    // Read filename
     std::string name(name_len, '\0');
     fs.read(&name[0], name_len);
     fs.ignore(extra_len);
+    if (fs.fail()) return fail("truncated NPZ entry header");
+    if (std::any_of(entries.begin(), entries.end(), [&name](const Entry& entry) {
+        return entry.name == name;
+      }))
+    {
+      return fail("NPZ contains duplicate entry: " + name);
+    }
 
-    // Read data
     std::vector<char> data(uncompressed_size);
     fs.read(data.data(), uncompressed_size);
     if (fs.fail()) {
-      spdlog::error("[npz_io] Truncated data for entry '{}'", name);
-      return false;
+      return fail("truncated data for NPZ entry: " + name);
     }
 
     entries.push_back({std::move(name), std::move(data)});
   }
 
   if (entries.empty()) {
-    spdlog::error("[npz_io] No entries found in {}", filename);
-    return false;
+    return fail("NPZ has no readable entries: " + filename);
   }
 
   // Find and parse metadata entry
@@ -506,13 +565,12 @@ bool loadNpz(const std::string& filename, ElevationMap& map) {
     if (e.name == "meta.npy") {
       detail::NpyInfo info;
       if (!detail::parseNpyHeader(e.data.data(), e.data.size(), info) ||
-          !info.is_string) {
-        spdlog::error("[npz_io] Invalid meta.npy header");
-        return false;
+          !info.is_string || !info.is_scalar_string)
+      {
+        return fail("meta.npy must contain a scalar string");
       }
-      if (info.data_offset + info.string_len > e.data.size()) {
-        spdlog::error("[npz_io] meta.npy data truncated");
-        return false;
+      if (info.string_len > e.data.size() - info.data_offset) {
+        return fail("meta.npy string data is truncated");
       }
       metadata_json.assign(e.data.data() + info.data_offset, info.string_len);
       found_meta = true;
@@ -521,12 +579,11 @@ bool loadNpz(const std::string& filename, ElevationMap& map) {
   }
 
   if (!found_meta) {
-    spdlog::error("[npz_io] No meta.npy entry in {}", filename);
-    return false;
+    return fail("NPZ is missing meta.npy: " + filename);
   }
 
   // Parse metadata
-  float version = 0;
+  double version = 0;
   float resolution = 0;
   double pos_x = 0, pos_y = 0;
   int size_rows = 0, size_cols = 0;
@@ -534,41 +591,51 @@ bool loadNpz(const std::string& filename, ElevationMap& map) {
   std::string frame_id;
 
   // Version check (absent in pre-v1 files → allow gracefully)
-  if (detail::jsonFloat(metadata_json, "version", version)) {
-    if (static_cast<int>(version) > detail::kMetadataVersion) {
-      spdlog::error("[npz_io] Unsupported metadata version {} (max {})",
-                    static_cast<int>(version), detail::kMetadataVersion);
-      return false;
+  if (detail::jsonFieldColon(metadata_json, "version") != std::string::npos) {
+    if (!detail::jsonDouble(metadata_json, "version", version) ||
+      !std::isfinite(version) || version < 0.0 ||
+      version > static_cast<double>(detail::kMetadataVersion) || std::trunc(version) != version)
+    {
+      return fail("NPZ metadata version is invalid or unsupported");
     }
   }
 
   if (!detail::jsonFloat(metadata_json, "resolution", resolution) ||
       !detail::jsonDoublePair(metadata_json, "position", pos_x, pos_y) ||
       !detail::jsonIntPair(metadata_json, "size", size_rows, size_cols)) {
-    spdlog::error("[npz_io] Incomplete metadata in {}", filename);
-    return false;
+    return fail("NPZ metadata is missing resolution, position, or size");
   }
-  detail::jsonString(metadata_json, "frame_id", frame_id);
-  detail::jsonIntPair(metadata_json, "start_index", start_x, start_y);
-
-  // Validate dimensions
-  if (size_rows <= 0 || size_cols <= 0 || resolution <= 0) {
-    spdlog::error("[npz_io] Invalid map dimensions ({}x{}, res={})", size_rows,
-                  size_cols, resolution);
-    return false;
+  if (!detail::jsonString(metadata_json, "frame_id", frame_id) || frame_id.empty()) {
+    return fail("NPZ metadata frame_id is missing or empty");
+  }
+  if (!detail::jsonIntPair(metadata_json, "start_index", start_x, start_y)) {
+    return fail("NPZ metadata start_index is missing or malformed");
   }
 
-  // Initialize map geometry
-  float length_x = resolution * size_rows;
-  float length_y = resolution * size_cols;
-  map.setFrameId(frame_id);
-  map.setGeometry(length_x, length_y, resolution);
-  map.setPosition(nanogrid::Position(pos_x, pos_y));
-  map.setStartIndex(nanogrid::Index(start_x, start_y));
+  if (size_rows <= 0 || size_cols <= 0 ||
+    static_cast<size_t>(size_rows) > kMaxMapCells / static_cast<size_t>(size_cols) ||
+    !std::isfinite(resolution) || resolution <= 0.0F ||
+    !std::isfinite(pos_x) || !std::isfinite(pos_y) ||
+    start_x < 0 || start_y < 0 || start_x >= size_rows || start_y >= size_cols)
+  {
+    return fail("NPZ metadata has invalid dimensions, geometry, or start_index");
+  }
 
-  // Load layer data
-  size_t expected_bytes =
-      static_cast<size_t>(size_rows) * size_cols * sizeof(float);
+  const float length_x = resolution * size_rows;
+  const float length_y = resolution * size_cols;
+  if (!std::isfinite(length_x) || !std::isfinite(length_y) ||
+    length_x <= 0.0F || length_y <= 0.0F)
+  {
+    return fail("NPZ metadata produces invalid map lengths");
+  }
+  ElevationMap loaded_map;
+  loaded_map.setFrameId(frame_id);
+  loaded_map.setGeometry(length_x, length_y, resolution);
+  loaded_map.setPosition(nanogrid::Position(pos_x, pos_y));
+  loaded_map.setStartIndex(nanogrid::Index(start_x, start_y));
+
+  const size_t expected_bytes =
+    static_cast<size_t>(size_rows) * static_cast<size_t>(size_cols) * sizeof(float);
   int layers_loaded = 0;
 
   for (const auto& e : entries) {
@@ -579,40 +646,47 @@ bool loadNpz(const std::string& filename, ElevationMap& map) {
       continue;
     }
     std::string layer_name = e.name.substr(0, e.name.size() - 4);
+    if (layer_name.empty()) return fail("NPZ contains an empty layer name");
 
     detail::NpyInfo info;
     if (!detail::parseNpyHeader(e.data.data(), e.data.size(), info) ||
-        !info.is_float_array) {
-      spdlog::warn("[npz_io] Skipping non-float entry '{}'", e.name);
-      continue;
+      !info.is_float_array)
+    {
+      return fail("layer '" + layer_name + "' must be a two-dimensional float32 array");
     }
 
-    if (info.rows != size_rows || info.cols != size_cols) {
-      spdlog::warn("[npz_io] Shape mismatch for '{}': ({}x{}) vs ({}x{})",
-                   layer_name, info.rows, info.cols, size_rows, size_cols);
-      continue;
+    if (info.rows != size_rows || info.cols != size_cols ||
+      !info.is_fortran_order)
+    {
+      return fail("layer '" + layer_name +
+        "' has an unexpected shape or is not stored in column-major order");
     }
 
-    if (info.data_offset + expected_bytes > e.data.size()) {
-      spdlog::warn("[npz_io] Truncated data for '{}'", layer_name);
-      continue;
+    if (info.data_offset > e.data.size() ||
+      expected_bytes != e.data.size() - info.data_offset)
+    {
+      return fail("layer '" + layer_name + "' has an invalid data length");
     }
 
-    // Add layer and copy data (column-major, matching Eigen layout)
-    if (!map.exists(layer_name)) {
-      map.add(layer_name);
+    if (!loaded_map.exists(layer_name)) {
+      loaded_map.add(layer_name);
     }
-    auto& matrix = map.get(layer_name);
+    auto& matrix = loaded_map.get(layer_name);
+    if (matrix.rows() != size_rows || matrix.cols() != size_cols ||
+      static_cast<size_t>(matrix.size()) != static_cast<size_t>(size_rows) * size_cols)
+    {
+      return fail("layer '" + layer_name + "' does not match map geometry");
+    }
     std::memcpy(matrix.data(), e.data.data() + info.data_offset,
                 expected_bytes);
     ++layers_loaded;
   }
 
-  if (layers_loaded == 0) {
-    spdlog::error("[npz_io] No layer data found in {}", filename);
-    return false;
+  if (layers_loaded == 0 || !loaded_map.exists(layer::elevation)) {
+    return fail("NPZ must contain at least one data layer including elevation");
   }
 
+  map = std::move(loaded_map);
   return true;
 }
 

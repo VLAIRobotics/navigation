@@ -16,6 +16,15 @@ geometry_msgs::msg::Pose makePose(double x, double y, double z, double yaw) {
   return pose;
 }
 
+Eigen::Isometry3d poseTransform(const geometry_msgs::msg::Pose & pose) {
+  Eigen::Isometry3d result = Eigen::Isometry3d::Identity();
+  result.translation() = Eigen::Vector3d(pose.position.x, pose.position.y, pose.position.z);
+  result.linear() = Eigen::Quaterniond(
+    pose.orientation.w, pose.orientation.x, pose.orientation.y,
+    pose.orientation.z).normalized().toRotationMatrix();
+  return result;
+}
+
 }  // namespace
 
 TEST(PoseUtils, InitialPoseIsPlanarMapOdomCorrection) {
@@ -67,6 +76,51 @@ TEST(PoseUtils, InitialPoseUsesSameTimePlanarOdomBody) {
     0.7, 1e-12);
 }
 
+TEST(PoseUtils, ClickedBasePoseUsesSameTimeFullOdometryAndBaseOffset) {
+  geometry_msgs::msg::Pose clicked = makePose(4.0, -2.0, 1.3, 0.6);
+  const Eigen::Isometry3d odom_base =
+    Eigen::Translation3d(1.2, 0.7, 0.8) *
+    Eigen::AngleAxisd(0.2, Eigen::Vector3d::UnitZ()) *
+    Eigen::AngleAxisd(-0.08, Eigen::Vector3d::UnitY());
+  const auto map_odom = small_gicp_relocalization::mapOdomFromClickedBasePose(
+    clicked, odom_base);
+  const auto recovered_map_base = map_odom * odom_base;
+
+  EXPECT_NEAR(recovered_map_base.translation().x(), clicked.position.x, 1e-12);
+  EXPECT_NEAR(recovered_map_base.translation().y(), clicked.position.y, 1e-12);
+  EXPECT_NEAR(recovered_map_base.translation().z(), clicked.position.z, 1e-12);
+  EXPECT_NEAR(
+    small_gicp_relocalization::rotationCorrection(
+      recovered_map_base, poseTransform(clicked)),
+    0.0, 1e-12);
+}
+
+TEST(PoseUtils, ClickedPlanarPoseKeepsTrustedHeightAndTilt) {
+  const Eigen::Isometry3d trusted_map_base =
+    Eigen::Translation3d(1.0, 2.0, 0.73) *
+    Eigen::AngleAxisd(0.4, Eigen::Vector3d::UnitZ()) *
+    Eigen::AngleAxisd(-0.12, Eigen::Vector3d::UnitY()) *
+    Eigen::AngleAxisd(0.06, Eigen::Vector3d::UnitX());
+  const auto clicked = makePose(3.0, -1.0, 0.0, -0.8);
+  const auto result = small_gicp_relocalization::clickedPlanarPoseWithReferenceHeightAndTilt(
+    clicked, trusted_map_base);
+  const auto result_transform = poseTransform(result);
+
+  EXPECT_DOUBLE_EQ(result.position.x, 3.0);
+  EXPECT_DOUBLE_EQ(result.position.y, -1.0);
+  EXPECT_NEAR(result.position.z, 0.73, 1e-12);
+  Eigen::Isometry3d expected_transform = Eigen::Isometry3d::Identity();
+  expected_transform.linear() =
+    Eigen::AngleAxisd(-0.8, Eigen::Vector3d::UnitZ()).toRotationMatrix() *
+    (Eigen::AngleAxisd(0.4, Eigen::Vector3d::UnitZ()) *
+    Eigen::AngleAxisd(-0.12, Eigen::Vector3d::UnitY()) *
+    Eigen::AngleAxisd(0.06, Eigen::Vector3d::UnitX())).toRotationMatrix();
+  EXPECT_NEAR(
+    small_gicp_relocalization::rotationCorrection(
+      result_transform, expected_transform),
+    0.0, 1e-12);
+}
+
 TEST(PoseUtils, MapOdomUsesSameTimeOdomBody) {
   Eigen::Isometry3d map_body = Eigen::Isometry3d::Identity();
   map_body.translation() = Eigen::Vector3d(5.0, 2.0, 1.0);
@@ -76,6 +130,25 @@ TEST(PoseUtils, MapOdomUsesSameTimeOdomBody) {
     small_gicp_relocalization::mapOdomFromMapBody(map_body, odom_body);
 
   EXPECT_TRUE((map_odom * odom_body).isApprox(map_body));
+}
+
+TEST(PoseUtils, MapOdomCandidateIsIndependentOfRobotMotionForContinuityChecks) {
+  const Eigen::Isometry3d common_map_odom =
+    Eigen::Translation3d(1.1, -0.4, 0.2) *
+    Eigen::AngleAxisd(0.16, Eigen::Vector3d::UnitZ());
+  const Eigen::Isometry3d first_odom_body =
+    Eigen::Translation3d(0.5, 0.2, 0.0) *
+    Eigen::AngleAxisd(-0.3, Eigen::Vector3d::UnitZ());
+  const Eigen::Isometry3d second_odom_body =
+    Eigen::Translation3d(4.2, -1.7, 0.0) *
+    Eigen::AngleAxisd(1.1, Eigen::Vector3d::UnitZ());
+
+  const auto first_candidate = small_gicp_relocalization::mapOdomFromMapBody(
+    common_map_odom * first_odom_body, first_odom_body);
+  const auto second_candidate = small_gicp_relocalization::mapOdomFromMapBody(
+    common_map_odom * second_odom_body, second_odom_body);
+
+  EXPECT_TRUE(first_candidate.isApprox(second_candidate, 1e-12));
 }
 
 TEST(PoseUtils, CorrectionMetricsCompareAgainstPrediction) {

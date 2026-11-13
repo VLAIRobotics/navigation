@@ -34,6 +34,10 @@ bool saveNpz(const std::string& filename, const ElevationMap& map,
 /// Load ElevationMap from .npz archive (saved by saveNpz).
 bool loadNpz(const std::string& filename, ElevationMap& map);
 
+/// Load an ElevationMap and provide a diagnostic when the archive is invalid.
+bool loadNpz(const std::string& filename, ElevationMap& map,
+             std::string* error);
+
 }  // namespace io
 }  // namespace fastdem
 

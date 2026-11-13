@@ -18,7 +18,18 @@ endif()
 # External (System)
 find_package(Eigen3 REQUIRED)
 find_package(yaml-cpp REQUIRED)
-find_package(spdlog REQUIRED)
+# Prefer the distro spdlog used by ROS when it is available. A newer copy in
+# /usr/local can otherwise provide headers at build time while the ROS process
+# loads the distro libspdlog with the same SONAME at runtime.
+set(_system_spdlog_cmake_dir
+  "/usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}/cmake/spdlog")
+if(CMAKE_LIBRARY_ARCHITECTURE AND
+  EXISTS "${_system_spdlog_cmake_dir}/spdlogConfig.cmake")
+  find_package(spdlog CONFIG REQUIRED
+    PATHS "${_system_spdlog_cmake_dir}" NO_DEFAULT_PATH)
+else()
+  find_package(spdlog REQUIRED)
+endif()
 
 # External (find first, FetchContent as fallback)
 find_package(nanoGrid QUIET)
@@ -53,6 +64,22 @@ target_include_directories(${PROJECT_NAME} PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/lib>
   $<INSTALL_INTERFACE:include>
 )
+if(CMAKE_LIBRARY_ARCHITECTURE AND
+  EXISTS "${_system_spdlog_cmake_dir}/spdlogConfig.cmake")
+  # CMake drops /usr/include as an implicit compiler path, leaving
+  # /usr/local/include/spdlog ahead of it. Add a build-local include root that
+  # points directly at the selected distro headers so they match libspdlog.
+  set(_system_spdlog_include_root "${CMAKE_CURRENT_BINARY_DIR}/system_spdlog_include")
+  file(MAKE_DIRECTORY "${_system_spdlog_include_root}")
+  foreach(_header_dir spdlog fmt)
+    if(NOT EXISTS "${_system_spdlog_include_root}/${_header_dir}")
+      file(CREATE_LINK "/usr/include/${_header_dir}"
+        "${_system_spdlog_include_root}/${_header_dir}" SYMBOLIC)
+    endif()
+  endforeach()
+  target_include_directories(${PROJECT_NAME} BEFORE PRIVATE
+    "${_system_spdlog_include_root}")
+endif()
 
 # Link libraries
 target_link_libraries(${PROJECT_NAME}

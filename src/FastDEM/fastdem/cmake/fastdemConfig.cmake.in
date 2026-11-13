@@ -3,7 +3,17 @@
 include(CMakeFindDependencyMacro)
 find_dependency(Eigen3)
 find_dependency(yaml-cpp)
-find_dependency(spdlog)
+set(_fastdem_system_spdlog_cmake_dir
+  "/usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}/cmake/spdlog")
+if(CMAKE_LIBRARY_ARCHITECTURE AND
+  EXISTS "${_fastdem_system_spdlog_cmake_dir}/spdlogConfig.cmake")
+  set(spdlog_DIR "${_fastdem_system_spdlog_cmake_dir}")
+  find_dependency(spdlog CONFIG)
+  unset(spdlog_DIR)
+else()
+  find_dependency(spdlog)
+endif()
+unset(_fastdem_system_spdlog_cmake_dir)
 find_dependency(OpenMP)
 
 # nanoGrid: find on system if it was not bundled at build time

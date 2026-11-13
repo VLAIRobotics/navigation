@@ -4,6 +4,10 @@ project(fastdem_ros2)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Load FastDEM before ROS dependencies so its exported spdlog dependency selects
+# the distro target before another package can define spdlog::spdlog from /usr/local.
+find_package(fastdem REQUIRED)
+
 # Default to Release build
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
@@ -24,9 +28,6 @@ find_package(grid_map_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 
-# Pure CMake dependency (our core library)
-find_package(fastdem REQUIRED)
-
 ###########
 ## Build ##
 ###########
@@ -39,6 +40,21 @@ add_executable(fastdem_node
 target_include_directories(fastdem_node PRIVATE
   include
 )
+if(CMAKE_LIBRARY_ARCHITECTURE AND
+  EXISTS "/usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}/cmake/spdlog/spdlogConfig.cmake")
+  # Ensure this wrapper compiles against the same distro spdlog headers as the
+  # imported shared library; /usr/local/include otherwise wins over /usr/include.
+  set(_system_spdlog_include_root "${CMAKE_CURRENT_BINARY_DIR}/system_spdlog_include")
+  file(MAKE_DIRECTORY "${_system_spdlog_include_root}")
+  foreach(_header_dir spdlog fmt)
+    if(NOT EXISTS "${_system_spdlog_include_root}/${_header_dir}")
+      file(CREATE_LINK "/usr/include/${_header_dir}"
+        "${_system_spdlog_include_root}/${_header_dir}" SYMBOLIC)
+    endif()
+  endforeach()
+  target_include_directories(fastdem_node BEFORE PRIVATE
+    "${_system_spdlog_include_root}")
+endif()
 
 ament_target_dependencies(fastdem_node
   rclcpp

@@ -45,15 +45,16 @@ for argument in "$@"; do
 done
 
 case "${chassis_model}" in
-  two_wheel|diff) ;;
+  two_wheel|diff)
+    chassis_model="two_wheel"
+    if [[ -z "${params_file}" ]]; then
+      params_file="${SCRIPT_DIR}/../src/bringup/config/nav2_theta_teb.yaml"
+    fi
+    ;;
   omni)
     if [[ -z "${params_file}" ]]; then
-      params_file="${SCRIPT_DIR}/../src/bringup/config/nav2_theta_teb_omni.yaml"
+      params_file="${SCRIPT_DIR}/../src/bringup/config/nav2_theta_teb.yaml"
     fi
-    [[ -r "${params_file}" ]] || {
-      echo "[!] Omni config not found: ${params_file}" >&2
-      exit 2
-    }
     ;;
   *)
     echo "[!] Unsupported chassis_model '${chassis_model}'; use two_wheel or omni." >&2
@@ -69,6 +70,8 @@ fi
 if [[ -n "${params_file}" && "${params_file_arg_seen}" == 0 ]]; then
   launch_args+=("params_file:=${params_file}")
 fi
+launch_args+=("chassis_model:=${chassis_model}")
+echo "[*] Chassis model=${chassis_model}; Nav2 parameter source=${params_file}"
 
 if [[ "${NAV2_AUTO_RESTART:-1}" != "1" ]]; then
   exec ros2 launch bringup nav2_theta_teb.launch.py "${launch_args[@]}"

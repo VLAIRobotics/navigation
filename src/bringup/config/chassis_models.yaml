@@ -1,0 +1,23 @@
+# Shared planar model used by both navigation launch files and the chassis
+# safety gate. The two_wheel x offsets match the current base_link placement.
+# The omni y half-width is 0.3125 m; verify the physical x offset on the robot
+# before enabling motion with this profile.
+two_wheel:
+  length: 0.625
+  width: 0.450
+  footprint:
+    - [0.275, 0.225]
+    - [0.275, -0.225]
+    - [-0.350, -0.225]
+    - [-0.350, 0.225]
+  flat_footprint: [0.275, 0.225, 0.275, -0.225, -0.350, -0.225, -0.350, 0.225]
+
+omni:
+  length: 0.625
+  width: 0.625
+  footprint:
+    - [0.275, 0.3125]
+    - [0.275, -0.3125]
+    - [-0.350, -0.3125]
+    - [-0.350, 0.3125]
+  flat_footprint: [0.275, 0.3125, 0.275, -0.3125, -0.350, -0.3125, -0.350, 0.3125]

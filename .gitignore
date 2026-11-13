@@ -14,4 +14,4 @@ __pycache__/
 nav2_overshoot_*.tar.gz
 .cache/clangd/index
 ros_ws/
-ai/private/
+ai/

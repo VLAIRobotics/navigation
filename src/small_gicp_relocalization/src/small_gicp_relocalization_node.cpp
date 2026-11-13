@@ -4,16 +4,20 @@
 #include <cinttypes>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <exception>
 #include <functional>
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -27,12 +31,15 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp/executors/multi_threaded_executor.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <std_srvs/srv/trigger.hpp>
 #include <tf2/exceptions.h>
 #include <tf2_eigen/tf2_eigen.hpp>
+#include <tf2_msgs/msg/tf_message.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 
@@ -42,7 +49,9 @@
 #include <small_gicp_relocalization/relocalization_hysteresis.hpp>
 #include <small_gicp_relocalization/registration_termination.hpp>
 #include <small_gicp_relocalization/relocalization_generation.hpp>
+#include <small_gicp_relocalization/snapshot_storage.hpp>
 #include <small_gicp_relocalization/pose_utils.hpp>
+#include <small_gicp_relocalization/manual_seed_deadline.hpp>
 #include <small_gicp_relocalization/fastlio_health.hpp>
 #include <small_gicp_relocalization/msg/map_odom_target.hpp>
 #include <small_gicp_relocalization/msg/relocalization_status.hpp>
@@ -118,6 +127,7 @@ public:
     map_frame_ = declare_parameter<std::string>("map_frame", "map");
     odom_frame_ = declare_parameter<std::string>("odom_frame", "odom");
     body_frame_ = declare_parameter<std::string>("body_frame", "body");
+    base_frame_ = declare_parameter<std::string>("base_frame", "base_link");
     registration_voxel_size_ = declare_parameter<double>("registration_voxel_size", 0.20);
     tracking_input_voxel_size_ = declare_parameter<double>("tracking_input_voxel_size", 0.25);
     display_voxel_size_ = declare_parameter<double>("display_voxel_size", 0.10);
@@ -164,8 +174,17 @@ public:
     validity_timeout_sec_ = declare_parameter<double>("validity_timeout", 10.0);
     max_consecutive_failures_ = declare_parameter<int>("max_consecutive_failures", 3);
     tf_lookup_timeout_sec_ = declare_parameter<double>("tf_lookup_timeout_sec", 0.05);
+    manual_seed_input_timeout_sec_ = declare_parameter<double>(
+      "manual_seed_input_timeout_sec", 3.0);
+    manual_seed_validation_timeout_sec_ = declare_parameter<double>(
+      "manual_seed_validation_timeout_sec", 10.0);
+    manual_seed_bbs_height_max_age_sec_ = declare_parameter<double>(
+      "manual_seed_bbs_height_max_age_sec", 1.0);
     timing_log_period_ms_ = declare_parameter<int>("timing_log_period_ms", 1000);
     offline_snapshot_dir_ = declare_parameter<std::string>("offline_snapshot_dir", "");
+    navigation_map_file_ = declare_parameter<std::string>("navigation_map_file", "");
+    startup_context_ = declare_parameter<std::string>("startup_context", "");
+    offline_snapshot_max_count_ = declare_parameter<int>("offline_snapshot_max_count", 8);
     handoff_topic_ = declare_parameter<std::string>(
       "handoff_topic", "/localization/map_odom_handoff");
     exit_after_localized_ = declare_parameter<bool>("exit_after_localized", false);
@@ -184,6 +203,9 @@ public:
       !std::isfinite(tracking_max_rotation_correction_) ||
       !std::isfinite(tracking_max_cloud_age_sec_) ||
       !std::isfinite(tracking_max_processing_time_sec_) ||
+      !std::isfinite(manual_seed_input_timeout_sec_) ||
+      !std::isfinite(manual_seed_validation_timeout_sec_) ||
+      !std::isfinite(manual_seed_bbs_height_max_age_sec_) ||
       !std::isfinite(tracking_small_correction_translation_m_) ||
       !std::isfinite(tracking_small_correction_rotation_rad_) ||
       !std::isfinite(tracking_consistency_translation_tolerance_m_) ||
@@ -231,6 +253,10 @@ public:
     validity_timeout_sec_ = std::max(validity_timeout_sec_, 0.01);
     max_consecutive_failures_ = std::max(max_consecutive_failures_, 1);
     tf_lookup_timeout_sec_ = std::max(tf_lookup_timeout_sec_, 0.0);
+    manual_seed_input_timeout_sec_ = std::max(manual_seed_input_timeout_sec_, 0.1);
+    manual_seed_validation_timeout_sec_ = std::max(manual_seed_validation_timeout_sec_, 0.1);
+    manual_seed_bbs_height_max_age_sec_ = std::max(manual_seed_bbs_height_max_age_sec_, 0.0);
+    offline_snapshot_max_count_ = std::clamp(offline_snapshot_max_count_, 1, 32);
     bbs_seed_retry_sec_ = std::max(bbs_seed_retry_sec_, 0.1);
     timing_log_period_ms_ = std::max(timing_log_period_ms_, 1);
     fastlio_health_timeout_sec_ = std::max(fastlio_health_timeout_sec_, 0.01);
@@ -243,6 +269,8 @@ public:
       "/small_gicp/aligned_cloud", rclcpp::QoS(10).reliable());
     pose_publisher_ = create_publisher<geometry_msgs::msg::PoseStamped>(
       "/small_gicp/pose", rclcpp::QoS(10));
+    candidate_pose_publisher_ = create_publisher<geometry_msgs::msg::PoseStamped>(
+      "/small_gicp/candidate_pose", rclcpp::QoS(10));
     status_publisher_ = create_publisher<small_gicp_relocalization::msg::RelocalizationStatus>(
       "/small_gicp/relocalization_status", rclcpp::QoS(10));
     handoff_publisher_ = create_publisher<small_gicp_relocalization::msg::MapOdomTarget>(
@@ -259,6 +287,17 @@ public:
       initial_pose_topic_, rclcpp::QoS(10),
       std::bind(&SmallGicpRelocalizationNode::initialPoseCallback, this, std::placeholders::_1),
       initial_pose_subscription_options);
+    cancel_manual_seed_service_ = create_service<std_srvs::srv::Trigger>(
+      "/small_gicp/cancel_manual_seed",
+      [this](
+        const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+        std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+      {
+        response->success = cancelManualSeedAndResumeAuto("service request");
+        response->message = response->success ?
+          "Manual seed cancelled; automatic BBS relocalization is active" :
+          "No active manual seed";
+      });
     if (!bbs_global_pose_topic_.empty()) {
       bbs_global_pose_subscription_ = create_subscription<geometry_msgs::msg::PoseStamped>(
         bbs_global_pose_topic_, rclcpp::QoS(10),
@@ -268,6 +307,28 @@ public:
     cloud_subscription_ = create_subscription<sensor_msgs::msg::PointCloud2>(
       cloud_topic_, rclcpp::SensorDataQoS().keep_last(1),
       std::bind(&SmallGicpRelocalizationNode::cloudCallback, this, std::placeholders::_1));
+    odometry_topic_ = declare_parameter<std::string>("odometry_topic", "/Odometry");
+    odometry_subscription_ = create_subscription<nav_msgs::msg::Odometry>(
+      odometry_topic_, rclcpp::QoS(64).best_effort(),
+      [this](const nav_msgs::msg::Odometry::SharedPtr message) {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        odometry_history_.push_back(*message);
+        while (odometry_history_.size() > 64) odometry_history_.pop_front();
+      });
+    dynamic_tf_subscription_ = create_subscription<tf2_msgs::msg::TFMessage>(
+      "/tf", rclcpp::QoS(128).best_effort(),
+      [this](const tf2_msgs::msg::TFMessage::SharedPtr message) {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        dynamic_tf_history_.push_back(*message);
+        while (dynamic_tf_history_.size() > 128) dynamic_tf_history_.pop_front();
+      });
+    static_tf_subscription_ = create_subscription<tf2_msgs::msg::TFMessage>(
+      "/tf_static", rclcpp::QoS(1).reliable().transient_local(),
+      [this](const tf2_msgs::msg::TFMessage::SharedPtr message) {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        static_tf_snapshot_ = *message;
+        have_static_tf_snapshot_ = true;
+      });
     fastlio_health_callback_group_ = create_callback_group(
       rclcpp::CallbackGroupType::MutuallyExclusive);
     rclcpp::SubscriptionOptions health_subscription_options;
@@ -296,6 +357,42 @@ public:
         loadMap();
       },
       map_load_callback_group_);
+    if (!offline_snapshot_dir_.empty()) {
+      snapshot_queue_.push_back([this]() {
+        try {
+          const auto root = std::filesystem::path(offline_snapshot_dir_);
+          const auto removed = small_gicp_relocalization::pruneSnapshotDirectories(
+            root, static_cast<std::size_t>(offline_snapshot_max_count_));
+          if (!pcd_file_.empty()) {
+            const auto map_version = small_gicp_relocalization::snapshotMapVersionKey(
+              pcd_file_, navigation_map_file_);
+            small_gicp_relocalization::pruneSnapshotMapVersions(root, map_version);
+          }
+          if (!removed.empty()) {
+            RCLCPP_INFO(
+              get_logger(), "Pruned %zu old offline GICP snapshots across sessions", removed.size());
+          }
+        } catch (const std::exception & exception) {
+          RCLCPP_WARN(
+            get_logger(), "Failed to prune old offline GICP snapshots: %s", exception.what());
+        }
+      });
+    }
+    snapshot_worker_thread_ = std::thread(
+      std::bind(&SmallGicpRelocalizationNode::snapshotWorkerLoop, this));
+    snapshot_queue_condition_.notify_one();
+  }
+
+  ~SmallGicpRelocalizationNode() override
+  {
+    {
+      std::lock_guard<std::mutex> lock(snapshot_queue_mutex_);
+      snapshot_worker_stopping_ = true;
+    }
+    snapshot_queue_condition_.notify_all();
+    if (snapshot_worker_thread_.joinable()) {
+      snapshot_worker_thread_.join();
+    }
   }
 
 private:
@@ -311,7 +408,6 @@ private:
         get_logger(), "pcd_file must be a readable regular file, got: %s", pcd_file_.c_str());
       throw std::runtime_error("pcd_file must be a regular PCD file: " + pcd_file_);
     }
-
     pcl::PointCloud<pcl::PointXYZ> raw_map;
     if (pcl::io::loadPCDFile<pcl::PointXYZ>(pcd_file_, raw_map) != 0 || raw_map.empty()) {
       RCLCPP_FATAL(get_logger(), "Failed to load non-empty PCD map: %s", pcd_file_.c_str());
@@ -386,6 +482,8 @@ private:
   {
     pending_initial_pose_ = pose;
     seed_initial_pose_ = pose;
+    seed_initial_pose_covariance_.fill(0.0);
+    seed_initial_pose_is_map_body_ = pose_is_map_body;
     pending_pose_is_map_body_ = pose_is_map_body;
     pending_pose_stamp_ = pose_stamp;
     has_pending_initial_pose_ = true;
@@ -401,16 +499,20 @@ private:
     stable_map_odom_.clear();
     has_stable_sequence_start_ = false;
     has_accepted_pose_ = false;
-    has_last_map_odom_ = false;
     initial_map_odom_.setIdentity();
-    preview_map_odom_.setIdentity();
-    last_map_odom_.setIdentity();
+    has_last_map_odom_ = has_trusted_map_odom_;
+    if (has_trusted_map_odom_) {
+      preview_map_odom_ = last_trusted_map_odom_;
+      last_map_odom_ = last_trusted_map_odom_;
+    } else {
+      preview_map_odom_.setIdentity();
+      last_map_odom_.setIdentity();
+    }
     last_processed_stamp_ns_ = 0;
     has_success_wall_time_ = false;
     has_verification_start_wall_time_ = false;
     has_multistart_validation_ = false;
     last_multistart_consistent_ = false;
-    snapshot_saved_ = false;
     has_tracking_attempt_wall_time_ = false;
     has_pending_tracking_candidate_ = false;
     pending_tracking_candidate_count_ = 0;
@@ -418,16 +520,24 @@ private:
     last_bbs_seed_time_ = std::chrono::steady_clock::now();
     has_bbs_seed_time_ = true;
     last_success_stamp_ = builtin_interfaces::msg::Time{};
+    candidate_source_ = manual_seed ? "manual" : "bbs3d";
+    status_detail_ = manual_seed ? "manual seed waiting for timestamped TF and input" :
+      "BBS seed verification started";
+    manual_seed_received_wall_time_ = std::chrono::steady_clock::now();
+    has_latest_candidate_pose_ = false;
+    last_match_status_ = small_gicp_relocalization::msg::RelocalizationStatus{};
     publishStatusLocked(
       pose_stamp.sec != 0 || pose_stamp.nanosec != 0 ? rclcpp::Time(pose_stamp) : now());
-    preview_map_odom_publisher_->publish(toTransform(
-      Eigen::Isometry3d::Identity(), map_frame_, odom_frame_, now()));
+    if (has_trusted_map_odom_) {
+      preview_map_odom_publisher_->publish(toTransform(
+        last_trusted_map_odom_, map_frame_, odom_frame_, now()));
+    }
     RCLCPP_INFO(
       get_logger(),
-      "Received %s generation=%" PRIu64 " map_body=(%.3f, %.3f, %.3f) yaw=%.3f; "
+      "Received %s generation=%" PRIu64 " pose=(%.3f, %.3f, %.3f) yaw=%.3f; "
       "waiting for %s->%s TF%s",
       source, generation, pose.position.x, pose.position.y, pose.position.z, yaw(pose),
-      odom_frame_.c_str(), body_frame_.c_str(),
+      odom_frame_.c_str(), pose_is_map_body ? body_frame_.c_str() : base_frame_.c_str(),
       pose_is_map_body ? " at the cloud timestamp" : "");
   }
 
@@ -441,12 +551,120 @@ private:
       return;
     }
 
+    auto pose = message->pose.pose;
+    const auto & q = pose.orientation;
+    const double q_norm = std::sqrt(
+      q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+    if (!std::isfinite(pose.position.x) || !std::isfinite(pose.position.y) ||
+      !std::isfinite(pose.position.z) || !std::isfinite(q_norm) || q_norm < 1e-8)
+    {
+      RCLCPP_WARN(get_logger(), "Ignoring non-finite or invalid /initialpose");
+      return;
+    }
+    pose.orientation.x /= q_norm;
+    pose.orientation.y /= q_norm;
+    pose.orientation.z /= q_norm;
+    pose.orientation.w /= q_norm;
+    if (message->header.stamp.sec == 0 && message->header.stamp.nanosec == 0) {
+      RCLCPP_WARN(
+        get_logger(), "Manual /initialpose has a zero stamp; applying it with the latest odom->base TF");
+    }
+    if (message->header.frame_id.empty()) {
+      RCLCPP_WARN(
+        get_logger(), "Manual /initialpose has an empty frame_id; interpreting its pose in '%s'",
+        map_frame_.c_str());
+    }
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
       resetInitializationLocked(
-        message->pose.pose, false, message->header.stamp, true, "manual initial pose");
+        pose, false, message->header.stamp, true, "manual initial pose for base_link");
+      seed_initial_pose_covariance_ = message->pose.covariance;
     }
     tryApplyPendingInitialPose("initial pose callback");
+  }
+
+  bool cancelManualSeedAndResumeAuto(const char * reason, bool failed = false)
+  {
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      if (!manual_seed_active_) {
+        return false;
+      }
+    }
+    saveOfflineSnapshotIfRequested(failed ? "manual_seed_failed" : "manual_seed_cancelled", now());
+    std::uint64_t generation = 0;
+    geometry_msgs::msg::PoseStamped::SharedPtr recent_bbs_candidate;
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      if (!manual_seed_active_) {
+        return false;
+      }
+      manual_seed_active_ = false;
+      has_pending_initial_pose_ = false;
+      pending_pose_is_map_body_ = false;
+      has_initial_pose_ = false;
+      applied_initialization_generation_ = 0;
+      ++initialization_generation_;
+      generation = initialization_generation_;
+      has_latest_candidate_pose_ = false;
+      last_match_status_ = small_gicp_relocalization::msg::RelocalizationStatus{};
+      relocalization_state_ = map_ready_.load(std::memory_order_acquire)
+        ? small_gicp_relocalization::msg::RelocalizationStatus::LOST
+        : small_gicp_relocalization::msg::RelocalizationStatus::MAP_LOADING;
+      consecutive_successes_ = 0;
+      consecutive_failures_ = 0;
+      stable_map_odom_.clear();
+      has_stable_sequence_start_ = false;
+      has_verification_start_wall_time_ = false;
+      has_success_wall_time_ = false;
+      clearPendingTrackingCandidateLocked();
+      candidate_source_ = "automatic_recovery";
+      status_detail_ = std::string("manual seed cancelled: ") + reason;
+      automatic_recovery_start_wall_time_ = std::chrono::steady_clock::now();
+      has_automatic_recovery_start_wall_time_ = true;
+      last_bbs_seed_time_ = std::chrono::steady_clock::now();
+      has_bbs_seed_time_ = true;
+      if (has_trusted_map_odom_) {
+        preview_map_odom_ = last_trusted_map_odom_;
+        last_map_odom_ = last_trusted_map_odom_;
+        has_last_map_odom_ = true;
+      }
+      if (has_latest_bbs_pose_) {
+        const rclcpp::Time bbs_stamp(
+          latest_bbs_pose_stamp_, get_clock()->get_clock_type());
+        const double bbs_age = std::abs((now() - bbs_stamp).seconds());
+        if (bbs_age <= manual_seed_bbs_height_max_age_sec_) {
+          recent_bbs_candidate = std::make_shared<geometry_msgs::msg::PoseStamped>();
+          recent_bbs_candidate->header.frame_id = map_frame_;
+          recent_bbs_candidate->header.stamp = latest_bbs_pose_stamp_;
+          recent_bbs_candidate->pose = latest_bbs_pose_;
+        }
+      }
+      publishStatusLocked(now());
+    }
+    bool has_trusted = false;
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      has_trusted = has_trusted_map_odom_;
+    }
+    if (failed) {
+      RCLCPP_ERROR(
+        get_logger(), "Manual seed failed (%s); generation=%" PRIu64
+        " returned to automatic BBS search; last trusted map->odom retained=%s",
+        reason, generation, has_trusted ? "yes" : "no");
+    } else {
+      RCLCPP_WARN(
+        get_logger(), "Manual seed cancelled (%s); generation=%" PRIu64
+        " returned to automatic BBS search; last trusted map->odom retained=%s",
+        reason, generation, has_trusted ? "yes" : "no");
+    }
+    if (recent_bbs_candidate) {
+      bbsGlobalPoseCallback(recent_bbs_candidate);
+    } else {
+      RCLCPP_INFO(
+        get_logger(), "Automatic relocalization is active; waiting for a fresh 3D-BBS candidate");
+    }
+    return true;
   }
 
   void bbsGlobalPoseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr message)
@@ -478,15 +696,24 @@ private:
     pose.orientation.z /= q_norm;
     pose.orientation.w /= q_norm;
 
+    bool manual_seed_active = false;
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
-      if (manual_seed_active_) {
-        RCLCPP_INFO_THROTTLE(
-          get_logger(), *get_clock(), 2000,
-          "Ignoring 3D-BBS pose while manual initial pose generation=%" PRIu64 " is active",
-          initialization_generation_);
-        return;
+      latest_bbs_pose_ = pose;
+      latest_bbs_pose_stamp_ = message->header.stamp;
+      has_latest_bbs_pose_ = true;
+      manual_seed_active = manual_seed_active_;
+      if (manual_seed_active) {
+        status_detail_ = "manual seed waiting for GICP; BBS supplies height/tilt only";
       }
+    }
+    if (manual_seed_active) {
+      tryApplyPendingInitialPose("BBS height/tilt prior");
+      return;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
       if (has_pending_initial_pose_ && !pending_pose_is_map_body_) {
         return;
       }
@@ -523,6 +750,7 @@ private:
     std::uint64_t generation = 0;
     bool pose_is_map_body = false;
     builtin_interfaces::msg::Time pose_stamp;
+    bool manual_seed = false;
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
       if (!has_pending_initial_pose_) {
@@ -532,29 +760,111 @@ private:
       generation = initialization_generation_;
       pose_is_map_body = pending_pose_is_map_body_;
       pose_stamp = pending_pose_stamp_;
+      manual_seed = manual_seed_active_;
     }
 
-    geometry_msgs::msg::TransformStamped latest_odom_body;
-    Eigen::Isometry3d odom_body = Eigen::Isometry3d::Identity();
-    bool have_odom_body = pose_is_map_body &&
-      lookupCachedOdomBody(pose_stamp, odom_body);
+    const std::string odometry_child_frame = pose_is_map_body ? body_frame_ : base_frame_;
+    Eigen::Isometry3d odom_reference = Eigen::Isometry3d::Identity();
+    bool have_odom_reference = pose_is_map_body &&
+      lookupCachedOdomBody(pose_stamp, odom_reference);
     try {
-      if (!have_odom_body) {
-        latest_odom_body = tf_buffer_.lookupTransform(
-          odom_frame_, body_frame_,
-          pose_is_map_body
-          ? rclcpp::Time(pose_stamp, get_clock()->get_clock_type())
-          : rclcpp::Time(0, 0, get_clock()->get_clock_type()),
+      if (!have_odom_reference) {
+        const bool has_source_stamp = pose_stamp.sec != 0 || pose_stamp.nanosec != 0;
+        const auto lookup_time = has_source_stamp ?
+          rclcpp::Time(pose_stamp, get_clock()->get_clock_type()) :
+          rclcpp::Time(0, 0, get_clock()->get_clock_type());
+        const auto odom_reference_transform = tf_buffer_.lookupTransform(
+          odom_frame_, odometry_child_frame, lookup_time,
           rclcpp::Duration::from_seconds(tf_lookup_timeout_sec_));
-        odom_body = toEigen(latest_odom_body);
+        odom_reference = toEigen(odom_reference_transform);
       }
     } catch (const tf2::TransformException & exception) {
+      updateInitialPoseWaitStatus(
+        generation, "TF unavailable at initial pose timestamp");
       RCLCPP_WARN_THROTTLE(
         get_logger(), *get_clock(), 1000,
         "Waiting to apply initial pose generation=%" PRIu64 " from %s: %s->%s TF "
         "unavailable: %s",
-        generation, source, odom_frame_.c_str(), body_frame_.c_str(), exception.what());
+        generation, source, odom_frame_.c_str(), odometry_child_frame.c_str(), exception.what());
       return;
+    }
+
+    if (manual_seed) {
+      const bool pose_has_explicit_height = std::abs(seed_pose.position.z) > 1e-3;
+      Eigen::Isometry3d trusted_map_odom = Eigen::Isometry3d::Identity();
+      bool has_trusted = false;
+      geometry_msgs::msg::PoseStamped bbs_pose;
+      bool has_bbs_pose = false;
+      {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        has_trusted = has_trusted_map_odom_;
+        trusted_map_odom = last_trusted_map_odom_;
+        if (has_latest_bbs_pose_) {
+          bbs_pose.pose = latest_bbs_pose_;
+          bbs_pose.header.stamp = latest_bbs_pose_stamp_;
+          has_bbs_pose = true;
+        }
+      }
+      if (!pose_has_explicit_height) {
+        if (has_trusted) {
+          const Eigen::Isometry3d trusted_map_base = trusted_map_odom * odom_reference;
+          seed_pose = small_gicp_relocalization::clickedPlanarPoseWithReferenceHeightAndTilt(
+            seed_pose, trusted_map_base);
+          RCLCPP_INFO_THROTTLE(
+            get_logger(), *get_clock(), 1000,
+            "Manual /initialpose kept trusted map-frame base height and tilt at its TF timestamp");
+        } else if (has_bbs_pose) {
+          const auto now_time = now();
+          const rclcpp::Time bbs_stamp(bbs_pose.header.stamp, get_clock()->get_clock_type());
+          const rclcpp::Time manual_stamp =
+            (pose_stamp.sec != 0 || pose_stamp.nanosec != 0) ?
+            rclcpp::Time(pose_stamp, get_clock()->get_clock_type()) : now_time;
+          const double age = std::abs((manual_stamp - bbs_stamp).seconds());
+          if (age <= manual_seed_bbs_height_max_age_sec_) {
+            try {
+              Eigen::Isometry3d bbs_odom_body = Eigen::Isometry3d::Identity();
+              if (!lookupCachedOdomBody(bbs_pose.header.stamp, bbs_odom_body)) {
+                const auto bbs_odom_body_transform = tf_buffer_.lookupTransform(
+                  odom_frame_, body_frame_, bbs_pose.header.stamp,
+                  rclcpp::Duration::from_seconds(tf_lookup_timeout_sec_));
+                bbs_odom_body = toEigen(bbs_odom_body_transform);
+              }
+              const Eigen::Isometry3d map_body = poseToIsometry(bbs_pose.pose);
+              const Eigen::Isometry3d bbs_map_odom = map_body * bbs_odom_body.inverse();
+              const Eigen::Isometry3d map_base_at_manual_stamp = bbs_map_odom * odom_reference;
+              seed_pose = small_gicp_relocalization::clickedPlanarPoseWithReferenceHeightAndTilt(
+                seed_pose, map_base_at_manual_stamp);
+              RCLCPP_INFO(
+                get_logger(), "Manual /initialpose uses BBS height/tilt projected to the click "
+                "timestamp (candidate age=%.3fs); clicked base XY/yaw are retained", age);
+            } catch (const tf2::TransformException & exception) {
+              updateInitialPoseWaitStatus(
+                generation, "TF unavailable for BBS height projection");
+              RCLCPP_WARN_THROTTLE(
+                get_logger(), *get_clock(), 1000,
+                "Waiting for timestamped odom->body TF to resolve manual seed height/tilt: %s",
+                exception.what());
+              return;
+            }
+          } else {
+            updateInitialPoseWaitStatus(
+              generation, "waiting for a timestamp-matched BBS height prior");
+            RCLCPP_WARN_THROTTLE(
+              get_logger(), *get_clock(), 1000,
+              "Waiting for a timestamp-matched BBS height prior for manual /initialpose "
+              "(candidate age=%.3fs limit=%.3fs)", age, manual_seed_bbs_height_max_age_sec_);
+            return;
+          }
+        } else {
+          updateInitialPoseWaitStatus(
+            generation, "waiting for trusted or BBS map height; zero height is not assumed");
+          RCLCPP_WARN_THROTTLE(
+            get_logger(), *get_clock(), 1000,
+            "Manual /initialpose has no trusted height and no recent BBS height prior; "
+            "waiting instead of assuming map Z=0");
+          return;
+        }
+      }
     }
 
     Eigen::Isometry3d applied_map_odom;
@@ -567,37 +877,60 @@ private:
       }
       if (pose_is_map_body) {
         applied_map_odom = small_gicp_relocalization::mapOdomFromMapBody(
-          poseToIsometry(seed_pose), odom_body);
+          poseToIsometry(seed_pose), odom_reference);
       } else {
-        applied_map_odom = small_gicp_relocalization::initialMapOdomFromClickedPose(
-          seed_pose, odom_body);
+        applied_map_odom = small_gicp_relocalization::mapOdomFromClickedBasePose(
+          seed_pose, odom_reference);
       }
       initial_map_odom_ = applied_map_odom;
-      preview_map_odom_ = applied_map_odom;
-      last_map_odom_ = applied_map_odom;
+      if (!has_trusted_map_odom_) {
+        preview_map_odom_ = applied_map_odom;
+      }
+      last_map_odom_ = has_trusted_map_odom_ ? last_trusted_map_odom_ : applied_map_odom;
       has_initial_pose_ = true;
       applied_initialization_generation_ = generation;
       has_accepted_pose_ = false;
-      has_last_map_odom_ = true;
+      has_last_map_odom_ = has_trusted_map_odom_;
       has_pending_initial_pose_ = false;
       pending_pose_is_map_body_ = false;
-      last_initialization_wall_time_ = std::chrono::steady_clock::now();
+      seed_initial_pose_ = seed_pose;
+      seed_initial_pose_is_map_body_ = pose_is_map_body;
+      status_detail_ = manual_seed ? "manual seed under GICP validation" :
+        "BBS seed under GICP validation";
       publishStatusLocked(now());
-      preview_map_odom_publisher_->publish(toTransform(
-        applied_map_odom, map_frame_, odom_frame_, now()));
+      if (has_trusted_map_odom_) {
+        preview_map_odom_publisher_->publish(toTransform(
+          last_trusted_map_odom_, map_frame_, odom_frame_, now()));
+      } else {
+        preview_map_odom_publisher_->publish(toTransform(
+          applied_map_odom, map_frame_, odom_frame_, now()));
+      }
       applied = true;
     }
 
     if (applied) {
       RCLCPP_INFO(
         get_logger(),
-        "Applied initial pose generation=%" PRIu64 " state=VERIFYING "
-        "seed_map_body=(%.3f, %.3f, %.3f) yaw=%.3f "
+        "Applied %s initial pose generation=%" PRIu64 " state=VERIFYING "
+        "seed=(%.3f, %.3f, %.3f) yaw=%.3f odom_reference=%s "
         "map_to_odom_translation=(%.3f, %.3f, %.3f) yaw=%.3f",
+        manual_seed ? "manual base_link" : "BBS body",
         generation, seed_pose.position.x, seed_pose.position.y, seed_pose.position.z,
-        yaw(seed_pose), applied_map_odom.translation().x(), applied_map_odom.translation().y(),
+        yaw(seed_pose), odometry_child_frame.c_str(), applied_map_odom.translation().x(), applied_map_odom.translation().y(),
         applied_map_odom.translation().z(), yaw(applied_map_odom));
     }
+  }
+
+  void updateInitialPoseWaitStatus(std::uint64_t generation, const std::string & detail)
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    if (generation != initialization_generation_ || !has_pending_initial_pose_ ||
+      status_detail_ == detail)
+    {
+      return;
+    }
+    status_detail_ = detail;
+    publishStatusLocked(now());
   }
 
   bool lookupCachedOdomBody(
@@ -614,56 +947,400 @@ private:
     return false;
   }
 
-  void saveOfflineSnapshotIfRequested(
-    const pcl::PointCloud<pcl::PointXYZ> & raw_source,
-    const Eigen::Isometry3d & odom_body)
+  void snapshotWorkerLoop()
+  {
+    while (true) {
+      std::function<void()> snapshot_writer;
+      {
+        std::unique_lock<std::mutex> lock(snapshot_queue_mutex_);
+        snapshot_queue_condition_.wait(lock, [this]() {
+          return snapshot_worker_stopping_ || !snapshot_queue_.empty();
+        });
+        if (snapshot_queue_.empty()) {
+          return;
+        }
+        snapshot_writer = std::move(snapshot_queue_.front());
+        snapshot_queue_.pop_front();
+      }
+      try {
+        snapshot_writer();
+      } catch (const std::exception & exception) {
+        RCLCPP_WARN(get_logger(), "Offline GICP snapshot worker failed: %s", exception.what());
+      } catch (...) {
+        RCLCPP_WARN(get_logger(), "Offline GICP snapshot worker failed with an unknown error");
+      }
+    }
+  }
+
+  void saveOfflineSnapshotIfRequested(const std::string & event, const rclcpp::Time & stamp)
   {
     if (offline_snapshot_dir_.empty()) {
       return;
     }
+    std::unique_lock<std::mutex> queue_lock(snapshot_queue_mutex_);
+    if (snapshot_worker_stopping_ ||
+      !small_gicp_relocalization::snapshotQueueHasCapacity(snapshot_queue_.size()))
+    {
+      queue_lock.unlock();
+      RCLCPP_WARN_THROTTLE(
+        get_logger(), *get_clock(), 5000,
+        "Offline GICP snapshot queue is full; dropping event '%s'", event.c_str());
+      return;
+    }
+    pcl::PointCloud<pcl::PointXYZ>::ConstPtr raw_source;
+    Eigen::Isometry3d odom_body = Eigen::Isometry3d::Identity();
+    Eigen::Isometry3d seed_map_odom = Eigen::Isometry3d::Identity();
+    Eigen::Isometry3d trusted_map_odom = Eigen::Isometry3d::Identity();
     geometry_msgs::msg::Pose seed_pose;
-    Eigen::Isometry3d seed_map_odom;
+    std::array<double, 36> seed_pose_covariance{};
+    geometry_msgs::msg::Pose bbs_pose;
+    builtin_interfaces::msg::Time bbs_stamp;
+    tf2_msgs::msg::TFMessage static_tf;
+    std::deque<tf2_msgs::msg::TFMessage> dynamic_tf;
+    std::deque<nav_msgs::msg::Odometry> odometry;
+    bool has_static_tf = false;
+    bool has_trusted = false;
+    bool has_cloud_odom = false;
+    bool has_bbs_pose = false;
+    bool has_candidate_pose = false;
+    geometry_msgs::msg::PoseStamped candidate_pose;
+    small_gicp_relocalization::msg::RelocalizationStatus latest_status;
+    bool fastlio_healthy = false;
+    bool has_fastlio_health = false;
+    std::string detail;
+    std::string candidate_source;
+    std::uint64_t generation = 0;
+    std::uint64_t cloud_generation = 0;
+    std::uint64_t snapshot_sequence = 0;
+    uint8_t state = small_gicp_relocalization::msg::RelocalizationStatus::MAP_LOADING;
+    uint32_t consecutive_failures = 0;
+    uint32_t pending_candidate_confirmations = 0;
+    double trusted_pose_age_sec = -1.0;
+    double point_cloud_age_sec = -1.0;
+    double tf_wait_sec = 0.0;
+    double matching_duration_ms = 0.0;
+    bool manual_seed_active = false;
+    int64_t cloud_stamp_ns = 0;
+    const auto event_stamp_ns = stamp.nanoseconds();
+    builtin_interfaces::msg::Time seed_pose_stamp;
+    bool seed_pose_is_map_body = false;
+    bool seed_transform_valid = false;
+    std::string snapshot_event_key;
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
-      if (snapshot_saved_ || !has_initial_pose_) {
+      if (!last_snapshot_cloud_) {
         return;
       }
-      snapshot_saved_ = true;
+      generation = initialization_generation_;
+      cloud_generation = last_snapshot_generation_;
+      cloud_stamp_ns = last_snapshot_stamp_ns_;
+      const auto key = std::to_string(generation) + ":" +
+        std::to_string(cloud_stamp_ns) + ":" + event;
+      if (!snapshot_events_saved_.insert(key)) {
+        return;
+      }
+      if (small_gicp_relocalization::isRateLimitedSnapshotEvent(event) &&
+        !snapshot_event_rate_limiter_.admit(
+          std::chrono::steady_clock::now(),
+          small_gicp_relocalization::kSnapshotEventMinimumInterval))
+      {
+        snapshot_events_saved_.erase(key);
+        return;
+      }
+      snapshot_event_key = key;
+      snapshot_sequence = ++snapshot_sequence_;
+      raw_source = last_snapshot_cloud_;
+      odom_body = last_snapshot_odom_body_;
+      has_cloud_odom = last_snapshot_has_odom_;
       seed_pose = seed_initial_pose_;
-      seed_map_odom = initial_map_odom_;
+      seed_pose_covariance = seed_initial_pose_covariance_;
+      seed_pose_stamp = pending_pose_stamp_;
+      seed_pose_is_map_body = seed_initial_pose_is_map_body_;
+      const bool current_seed_applied = has_initial_pose_ &&
+        applied_initialization_generation_ == initialization_generation_;
+      seed_map_odom = has_trusted_map_odom_ && has_accepted_pose_ ? last_map_odom_ :
+        (current_seed_applied ? initial_map_odom_ : last_trusted_map_odom_);
+      seed_transform_valid = has_cloud_odom &&
+        (current_seed_applied || (has_trusted_map_odom_ && has_accepted_pose_));
+      trusted_map_odom = last_trusted_map_odom_;
+      has_trusted = has_trusted_map_odom_;
+      if (has_latest_bbs_pose_) {
+        bbs_pose = latest_bbs_pose_;
+        bbs_stamp = latest_bbs_pose_stamp_;
+        has_bbs_pose = true;
+      }
+      has_candidate_pose = has_latest_candidate_pose_;
+      candidate_pose = latest_candidate_pose_;
+      has_candidate_pose = has_candidate_pose &&
+        latest_candidate_generation_ == initialization_generation_;
+      latest_status = last_match_status_;
+      static_tf = static_tf_snapshot_;
+      has_static_tf = have_static_tf_snapshot_;
+      dynamic_tf = dynamic_tf_history_;
+      odometry = odometry_history_;
+      has_fastlio_health = has_fastlio_health_;
+      fastlio_healthy = fastlio_healthy_;
+      detail = status_detail_;
+      candidate_source = candidate_source_;
+      state = relocalization_state_;
+      consecutive_failures = consecutive_failures_;
+      pending_candidate_confirmations = pending_tracking_candidate_count_;
+      trusted_pose_age_sec = has_last_trusted_success_wall_time_
+        ? std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - last_trusted_success_wall_time_).count()
+        : -1.0;
+      point_cloud_age_sec = std::max(
+        0.0, (stamp.nanoseconds() - last_snapshot_stamp_ns_) / 1.0e9);
+      tf_wait_sec = latest_tf_wait_sec_;
+      matching_duration_ms = latest_match_duration_ms_;
+      manual_seed_active = manual_seed_active_;
     }
 
+    std::function<void()> snapshot_writer = [=,
+      raw_source = std::move(raw_source),
+      static_tf = std::move(static_tf),
+      dynamic_tf = std::move(dynamic_tf),
+      odometry = std::move(odometry)]() {
+    std::filesystem::path event_dir;
+    bool map_pcd_copied = false;
+    bool navigation_map_copied = false;
     try {
-      std::filesystem::create_directories(offline_snapshot_dir_);
-      const auto cloud_path = std::filesystem::path(offline_snapshot_dir_) /
+      const auto root = std::filesystem::path(offline_snapshot_dir_);
+      std::filesystem::create_directories(root);
+      const auto map_version = small_gicp_relocalization::snapshotMapVersionKey(
+        pcd_file_, navigation_map_file_);
+      const auto map_cache_dir = root / "maps" / ("version_" + map_version);
+      std::ostringstream sequence_name;
+      sequence_name << "sample_" << producer_session_id_ << "_" << std::setw(6) <<
+        std::setfill('0') << snapshot_sequence;
+      event_dir = root / (sequence_name.str() +
+        "_gen_" + std::to_string(generation) + "_" + event);
+      if (!std::filesystem::create_directory(event_dir)) {
+        throw std::runtime_error("snapshot directory already exists: " + event_dir.string());
+      }
+      std::filesystem::create_directories(map_cache_dir);
+      const auto cached_localization_map = map_cache_dir / "map.pcd";
+      small_gicp_relocalization::cacheSnapshotAsset(
+        pcd_file_, cached_localization_map, std::to_string(producer_session_id_));
+      small_gicp_relocalization::linkOrCopySnapshotAsset(
+        cached_localization_map, event_dir / "map.pcd");
+      map_pcd_copied = true;
+      if (!navigation_map_file_.empty()) {
+        const auto cached_navigation_map = map_cache_dir / "navigation_terrain_map.npz";
+        small_gicp_relocalization::cacheSnapshotAsset(
+          navigation_map_file_, cached_navigation_map, std::to_string(producer_session_id_));
+        small_gicp_relocalization::linkOrCopySnapshotAsset(
+          cached_navigation_map, event_dir / "navigation_terrain_map.npz");
+        navigation_map_copied = true;
+      }
+      const auto cloud_path = event_dir /
         "cloud_registered_body_downsampled.pcd";
-      const auto odom_body_path = std::filesystem::path(offline_snapshot_dir_) /
+      const auto odom_body_path = event_dir /
         "odom_to_body.txt";
-      const auto initial_pose_path = std::filesystem::path(offline_snapshot_dir_) /
+      const auto initial_pose_path = event_dir /
         "initial_pose.yaml";
-      const auto seed_path = std::filesystem::path(offline_snapshot_dir_) /
+      const auto seed_path = event_dir /
         "seed_map_body.txt";
-      if (pcl::io::savePCDFileBinary(cloud_path.string(), raw_source) != 0) {
+      if (pcl::io::savePCDFileBinary(cloud_path.string(), *raw_source) != 0) {
         throw std::runtime_error("failed to save snapshot PCD");
       }
-      std::ofstream odom_body_file(odom_body_path);
-      odom_body_file << odom_body.matrix() << '\n';
+      {
+        if (has_cloud_odom) {
+          std::ofstream odom_body_file(odom_body_path);
+          odom_body_file << odom_body.matrix() << '\n';
+        }
+        std::ofstream seed_odom_file(event_dir / "seed_map_odom.txt");
+        if (seed_transform_valid) seed_odom_file << seed_map_odom.matrix() << '\n';
+        if (has_trusted) {
+          std::ofstream trusted_file(event_dir / "last_trusted_map_odom.txt");
+          trusted_file << trusted_map_odom.matrix() << '\n';
+        }
+      }
       std::ofstream initial_pose_file(initial_pose_path);
       initial_pose_file << "position: [" << seed_pose.position.x << ", "
                         << seed_pose.position.y << ", " << seed_pose.position.z << "]\n"
                         << "orientation: [" << seed_pose.orientation.x << ", "
                         << seed_pose.orientation.y << ", " << seed_pose.orientation.z << ", "
-                        << seed_pose.orientation.w << "]\n";
-      const Eigen::Isometry3d seed_map_body = seed_map_odom * odom_body;
-      std::ofstream seed_file(seed_path);
-      seed_file << seed_map_body.matrix() << '\n';
+                        << seed_pose.orientation.w << "]\n"
+                        << "stamp_ns: " << seed_pose_stamp.sec * 1000000000LL +
+                        seed_pose_stamp.nanosec << "\n"
+                        << "frame_id: " << map_frame_ << "\n"
+                        << "pose_child_frame: " <<
+                        (seed_pose_is_map_body ? body_frame_ : base_frame_) << "\n";
+      initial_pose_file << "covariance: [";
+      for (std::size_t index = 0; index < seed_pose_covariance.size(); ++index) {
+        if (index > 0) initial_pose_file << ", ";
+        initial_pose_file << seed_pose_covariance[index];
+      }
+      initial_pose_file << "]\n";
+      if (seed_transform_valid) {
+        const Eigen::Isometry3d seed_map_body = seed_map_odom * odom_body;
+        std::ofstream seed_file(seed_path);
+        seed_file << seed_map_body.matrix() << '\n';
+      }
+      const auto write_tf = [](std::ostream & output, const tf2_msgs::msg::TFMessage & message) {
+          for (const auto & transform : message.transforms) {
+            output << transform.header.stamp.sec << '.' << transform.header.stamp.nanosec << ' '
+                   << transform.header.frame_id << ' ' << transform.child_frame_id << ' '
+                   << transform.transform.translation.x << ' '
+                   << transform.transform.translation.y << ' '
+                   << transform.transform.translation.z << ' '
+                   << transform.transform.rotation.x << ' '
+                   << transform.transform.rotation.y << ' '
+                   << transform.transform.rotation.z << ' '
+                   << transform.transform.rotation.w << '\n';
+          }
+        };
+      {
+        std::ofstream tf_static_file(event_dir / "tf_static.txt");
+        if (has_static_tf) write_tf(tf_static_file, static_tf);
+        std::ofstream tf_file(event_dir / "tf_history.txt");
+        for (const auto & message : dynamic_tf) write_tf(tf_file, message);
+      }
+      {
+        std::ofstream odometry_file(event_dir / "Odometry_history.txt");
+        for (const auto & message : odometry) {
+          odometry_file << message.header.stamp.sec << '.' << message.header.stamp.nanosec << ' '
+                        << message.header.frame_id << ' ' << message.child_frame_id << ' '
+                        << message.pose.pose.position.x << ' ' << message.pose.pose.position.y << ' '
+                        << message.pose.pose.position.z << ' '
+                        << message.pose.pose.orientation.x << ' '
+                        << message.pose.pose.orientation.y << ' '
+                        << message.pose.pose.orientation.z << ' '
+                        << message.pose.pose.orientation.w << ' '
+                        << message.twist.twist.linear.x << ' '
+                        << message.twist.twist.linear.y << ' '
+                        << message.twist.twist.linear.z << ' '
+                        << message.twist.twist.angular.x << ' '
+                        << message.twist.twist.angular.y << ' '
+                        << message.twist.twist.angular.z << '\n';
+        }
+      }
+      {
+        std::ofstream bbs_file(event_dir / "bbs_candidate.txt");
+        if (has_bbs_pose) {
+          bbs_file << bbs_stamp.sec << '.' << bbs_stamp.nanosec << ' '
+                   << bbs_pose.position.x << ' ' << bbs_pose.position.y << ' '
+                   << bbs_pose.position.z << ' ' << bbs_pose.orientation.x << ' '
+                   << bbs_pose.orientation.y << ' ' << bbs_pose.orientation.z << ' '
+                   << bbs_pose.orientation.w << '\n';
+        }
+        std::ofstream health_file(event_dir / "fastlio_health.txt");
+        health_file << "received=" << has_fastlio_health << " healthy=" << fastlio_healthy << '\n';
+      }
+      {
+        std::ofstream candidate_file(event_dir / "gicp_candidate.txt");
+        if (has_candidate_pose) {
+          candidate_file << candidate_pose.header.stamp.sec << '.'
+                         << candidate_pose.header.stamp.nanosec << ' '
+                         << candidate_pose.header.frame_id << ' '
+                         << candidate_pose.pose.position.x << ' '
+                         << candidate_pose.pose.position.y << ' '
+                         << candidate_pose.pose.position.z << ' '
+                         << candidate_pose.pose.orientation.x << ' '
+                         << candidate_pose.pose.orientation.y << ' '
+                         << candidate_pose.pose.orientation.z << ' '
+                         << candidate_pose.pose.orientation.w << '\n';
+        }
+      }
+      {
+        std::ofstream manifest(event_dir / "manifest.yaml");
+        manifest << "event: " << event << '\n'
+                 << "generation: " << generation << '\n'
+                 << "cloud_generation: " << cloud_generation << '\n'
+                 << "producer_session_id: " << producer_session_id_ << '\n'
+                 << "event_stamp_ns: " << event_stamp_ns << '\n'
+                 << "cloud_stamp_ns: " << cloud_stamp_ns << '\n'
+                 << "cloud_points: " << raw_source->size() << '\n'
+                 << "cloud_odom_available: " << has_cloud_odom << '\n'
+                 << "seed_transform_valid: " << seed_transform_valid << '\n'
+                 << "cloud_frame: " << body_frame_ << '\n'
+                 << "state: " << static_cast<unsigned int>(state) << '\n'
+                 << "map_frame: " << map_frame_ << '\n'
+                 << "odom_frame: " << odom_frame_ << '\n'
+                 << "base_frame: " << base_frame_ << '\n'
+                 << "candidate_source: " << candidate_source << '\n'
+                 << "state_detail: \"" << detail << "\"\n"
+                 << "manual_seed_active: " << manual_seed_active << '\n'
+                 << "consecutive_failures: " << consecutive_failures << '\n'
+                 << "pending_candidate_confirmations: " <<
+                 pending_candidate_confirmations << '\n'
+                 << "last_trusted_pose_age_sec: " << trusted_pose_age_sec << '\n'
+                 << "point_cloud_age_sec: " << point_cloud_age_sec << '\n'
+                 << "tf_wait_sec: " << tf_wait_sec << '\n'
+                 << "matching_duration_ms: " << matching_duration_ms << '\n'
+                 << "registration_voxel_size: " << registration_voxel_size_ << '\n'
+                 << "tracking_input_voxel_size: " << tracking_input_voxel_size_ << '\n'
+                 << "tracking_frequency_hz: " << tracking_frequency_hz_ << '\n'
+                 << "max_translation_jump: " << max_translation_jump_ << '\n'
+                 << "max_rotation_jump: " << max_rotation_jump_ << '\n'
+                 << "num_threads: " << num_threads_ << '\n'
+                 << "pcd_file: \"" << pcd_file_ << "\"\n"
+                 << "navigation_map_file: \"" << navigation_map_file_ << "\"\n"
+                 << "map_version: " << map_version << '\n'
+                 << "startup_context: \"" << startup_context_ << "\"\n"
+                 << "static_tf_captured: " << has_static_tf << '\n'
+                 << "localization_map_copied: " << map_pcd_copied << '\n'
+                 << "navigation_map_copied: " << navigation_map_copied << '\n'
+                 << "dynamic_tf_messages: " << dynamic_tf.size() << '\n'
+                 << "odometry_messages: " << odometry.size() << '\n'
+                 << "fastlio_health_received: " << has_fastlio_health << '\n'
+                 << "fastlio_healthy: " << fastlio_healthy << '\n'
+                 << "gicp_candidate_available: " << has_candidate_pose << '\n'
+                 << "gicp_candidate_stamp_ns: " <<
+                 static_cast<std::int64_t>(candidate_pose.header.stamp.sec) * 1000000000LL +
+                 candidate_pose.header.stamp.nanosec << '\n'
+                 << "gicp_num_inliers: " << latest_status.num_inliers << '\n'
+                 << "gicp_inlier_ratio: " << latest_status.inlier_ratio << '\n'
+                 << "gicp_match_sectors: " << latest_status.match_sectors << '\n'
+                 << "gicp_match_coverage_ratio: " << latest_status.match_coverage_ratio << '\n'
+                 << "gicp_multistart_consistent: " << latest_status.multistart_consistent << '\n'
+                 << "gicp_geometry_rmse_m: " << latest_status.geometry_rmse_m << '\n'
+                 << "gicp_geometry_p95_m: " << latest_status.geometry_p95_m << '\n'
+                 << "gicp_correction_translation_m: " <<
+                 latest_status.correction_translation << '\n'
+                 << "gicp_correction_rotation_rad: " <<
+                 latest_status.correction_rotation << '\n'
+                 << "max_correspondence_distance_m: " << max_correspondence_distance_ << '\n'
+                 << "max_iterations: " << max_iterations_ << '\n'
+                 << "min_inliers: " << min_inliers_ << '\n'
+                 << "min_inlier_ratio: " << min_inlier_ratio_ << '\n'
+                 << "max_geometry_rmse_m: " << max_geometry_rmse_m_ << '\n'
+                 << "max_geometry_p95_m: " << max_geometry_p95_m_ << '\n'
+                 << "min_match_sectors: " << min_match_sectors_ << '\n'
+                 << "require_multistart_consistency: " << require_multistart_consistency_ << '\n'
+                 << "max_multistart_translation_spread_m: " <<
+                 max_multistart_translation_spread_ << '\n'
+                 << "max_multistart_yaw_spread_rad: " << max_multistart_yaw_spread_ << '\n'
+                 << "stable_frames_required: " << stable_frames_required_ << '\n'
+                 << "stable_duration_sec: " << min_stable_duration_sec_ << '\n'
+                 << "tracking_frequency_hz: " << tracking_frequency_hz_ << '\n'
+                 << "tracking_max_cloud_age_sec: " << tracking_max_cloud_age_sec_ << '\n'
+                 << "manual_seed_input_timeout_sec: " << manual_seed_input_timeout_sec_ << '\n'
+                 << "manual_seed_validation_timeout_sec: " <<
+                 manual_seed_validation_timeout_sec_ << '\n';
+      }
+      small_gicp_relocalization::pruneSnapshotDirectories(
+        root, static_cast<std::size_t>(offline_snapshot_max_count_));
+      small_gicp_relocalization::pruneSnapshotMapVersions(root, map_version);
       RCLCPP_INFO(
-        get_logger(), "Saved offline GICP snapshot to %s", offline_snapshot_dir_.c_str());
+        get_logger(), "Saved offline GICP %s snapshot to %s (cloud=%zu points, generation=%" PRIu64 ")",
+        event.c_str(), event_dir.c_str(), raw_source->size(), generation);
     } catch (const std::exception & exception) {
-      std::lock_guard<std::mutex> lock(state_mutex_);
-      snapshot_saved_ = false;
+      if (!event_dir.empty()) {
+        std::error_code cleanup_error;
+        std::filesystem::remove_all(event_dir, cleanup_error);
+      }
+      if (!snapshot_event_key.empty()) {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        snapshot_events_saved_.erase(snapshot_event_key);
+      }
       RCLCPP_WARN(get_logger(), "Failed to save offline GICP snapshot: %s", exception.what());
     }
+    };
+    snapshot_queue_.push_back(std::move(snapshot_writer));
+    queue_lock.unlock();
+    snapshot_queue_condition_.notify_one();
   }
 
   void cloudCallback(const sensor_msgs::msg::PointCloud2::SharedPtr message) {
@@ -673,6 +1350,7 @@ private:
     uint8_t result_state = small_gicp_relocalization::msg::RelocalizationStatus::MAP_LOADING;
     Eigen::Isometry3d odom_body_eigen = Eigen::Isometry3d::Identity();
     bool have_odom_body_transform = false;
+    const auto first_tf_lookup_start = std::chrono::steady_clock::now();
     if (message->header.frame_id == body_frame_ && stamp.nanoseconds() > 0) {
       try {
         const auto stamped_odom_body = tf_buffer_.lookupTransform(
@@ -682,6 +1360,8 @@ private:
         have_odom_body_transform = true;
         std::lock_guard<std::mutex> lock(state_mutex_);
         odom_body_history_.emplace_back(stamp.nanoseconds(), odom_body_eigen);
+        latest_tf_wait_sec_ = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - first_tf_lookup_start).count();
         constexpr std::size_t kMaxOdomBodyHistory = 2048;
         while (odom_body_history_.size() > kMaxOdomBodyHistory) {
           odom_body_history_.pop_front();
@@ -689,6 +1369,9 @@ private:
       } catch (const tf2::TransformException &) {
         // The registered cloud can arrive before its matching TF; the normal path below
         // retries with the configured timeout after initialization has been applied.
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        latest_tf_wait_sec_ = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - first_tf_lookup_start).count();
       }
     }
     if (!map_ready_.load(std::memory_order_acquire)) {
@@ -745,9 +1428,8 @@ private:
       if (!fastlioHealthyLocked()) {
         const bool cleared_candidate =
           tracking_mode && clearPendingTrackingCandidateLocked();
-        if (cleared_candidate) {
-          publishStatusLocked(now());
-        }
+        status_detail_ = "input expired: FAST-LIO health is false or stale";
+        if (tracking_mode || cleared_candidate) publishStatusLocked(now());
         RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 2000,
           "Skipping GICP cloud stamp=%" PRId64 ": FAST-LIO health is false or stale",
@@ -771,25 +1453,80 @@ private:
       }
     }
 
+    pcl::PointCloud<pcl::PointXYZ> raw_source;
+    try {
+      pcl::fromROSMsg(*message, raw_source);
+    } catch (const std::exception &exception) {
+      RCLCPP_WARN(get_logger(), "Failed to convert input cloud: %s", exception.what());
+      markRegistrationFailure(
+        stamp, 0, 0.0, 0.0, 0.0, 0.0, result_generation, 0.0, false,
+        "input point cloud conversion failed");
+      return;
+    }
+    if (raw_source.empty()) {
+      RCLCPP_WARN(
+        get_logger(), "Rejecting GICP generation=%" PRIu64 ": source cloud is empty",
+        result_generation);
+      markRegistrationFailure(
+        stamp, 0, 0.0, 0.0, 0.0, 0.0, result_generation, 0.0, false,
+        "input point cloud is empty");
+      return;
+    }
+    {
+      auto scan_snapshot = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>(raw_source);
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      last_snapshot_cloud_ = std::move(scan_snapshot);
+      last_snapshot_stamp_ns_ = stamp.nanoseconds();
+      last_snapshot_generation_ = result_generation;
+      last_snapshot_has_odom_ = false;
+    }
+
     if (!have_odom_body_transform) {
+      const auto tf_lookup_start = std::chrono::steady_clock::now();
       try {
         const auto odom_body = tf_buffer_.lookupTransform(
           odom_frame_, body_frame_, message->header.stamp,
           rclcpp::Duration::from_seconds(tf_lookup_timeout_sec_));
         odom_body_eigen = toEigen(odom_body);
       } catch (const tf2::TransformException &exception) {
+        {
+          std::lock_guard<std::mutex> lock(state_mutex_);
+          latest_tf_wait_sec_ = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - tf_lookup_start).count();
+        }
         RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), 2000, "Cannot lookup %s->%s: %s",
           odom_frame_.c_str(), body_frame_.c_str(), exception.what());
         RCLCPP_WARN(
           get_logger(), "Rejecting GICP generation=%" PRIu64 ": odom->body TF unavailable",
           result_generation);
-        markRegistrationFailure(stamp, 0, 0.0, 0.0, 0.0, 0.0, result_generation);
+        {
+          std::lock_guard<std::mutex> lock(state_mutex_);
+          status_detail_ = "input TF unavailable at cloud timestamp";
+        }
+        markRegistrationFailure(
+          stamp, 0, 0.0, 0.0, 0.0, 0.0, result_generation, 0.0, false,
+          "input TF unavailable at cloud timestamp");
         return;
+      }
+      {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        latest_tf_wait_sec_ = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - tf_lookup_start).count();
+      }
+    }
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      if (last_snapshot_stamp_ns_ == stamp.nanoseconds() &&
+        last_snapshot_generation_ == result_generation)
+      {
+        last_snapshot_odom_body_ = odom_body_eigen;
+        last_snapshot_has_odom_ = true;
       }
     }
 
     Eigen::Isometry3d predicted_map_body = odom_body_eigen;
+    Eigen::Isometry3d predicted_map_odom = Eigen::Isometry3d::Identity();
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
       if (!generationIsAppliedLocked(result_generation)) {
@@ -798,25 +1535,10 @@ private:
       const Eigen::Isometry3d &map_odom_seed =
         relocalization_state_ ==
         small_gicp_relocalization::msg::RelocalizationStatus::LOCALIZED && has_accepted_pose_
-        ? last_map_odom_ : preview_map_odom_;
+        ? last_map_odom_ : (has_trusted_map_odom_ ? initial_map_odom_ : preview_map_odom_);
+      predicted_map_odom = map_odom_seed;
       predicted_map_body = small_gicp_relocalization::predictMapBody(
         map_odom_seed, odom_body_eigen);
-    }
-
-    pcl::PointCloud<pcl::PointXYZ> raw_source;
-    try {
-      pcl::fromROSMsg(*message, raw_source);
-    } catch (const std::exception &exception) {
-      RCLCPP_WARN(get_logger(), "Failed to convert input cloud: %s", exception.what());
-      markRegistrationFailure(stamp, 0, 0.0, 0.0, 0.0, 0.0, result_generation);
-      return;
-    }
-    if (raw_source.empty()) {
-      RCLCPP_WARN(
-        get_logger(), "Rejecting GICP generation=%" PRIu64 ": source cloud is empty",
-        result_generation);
-      markRegistrationFailure(stamp, 0, 0.0, 0.0, 0.0, 0.0, result_generation);
-      return;
     }
 
     {
@@ -831,8 +1553,6 @@ private:
       }
     }
 
-    saveOfflineSnapshotIfRequested(raw_source, odom_body_eigen);
-
     const auto source_downsample_start = std::chrono::steady_clock::now();
 
     const double input_voxel_size = tracking_mode
@@ -846,7 +1566,9 @@ private:
         "Rejecting GICP generation=%" PRIu64 ": source points after voxelization=%zu, "
         "minimum=%d",
         result_generation, source_cloud->size(), std::max(num_neighbors_, 5));
-      markRegistrationFailure(stamp, 0, 0.0, 0.0, 0.0, 0.0, result_generation);
+      markRegistrationFailure(
+        stamp, 0, 0.0, 0.0, 0.0, 0.0, result_generation, 0.0, false,
+        "too few source points after voxelization");
       return;
     }
     const double source_downsample_ms = elapsedMilliseconds(source_downsample_start);
@@ -1017,6 +1739,10 @@ private:
     const double registration_elapsed_ms = std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now() - registration_start).count();
     const double processing_elapsed_ms = elapsedMilliseconds(processing_start);
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      latest_match_duration_ms_ = processing_elapsed_ms;
+    }
     const bool finite_gate = finite_map_body && std::isfinite(inlier_ratio) &&
       std::isfinite(coverage.rmse_m) && std::isfinite(coverage.p95_m) &&
       std::isfinite(correction_translation) && std::isfinite(correction_rotation);
@@ -1055,7 +1781,8 @@ private:
         result_rejection_reason == "processing_timeout"))
       {
         markRegistrationFailure(stamp, result.num_inliers, inlier_ratio, coverage.rmse_m,
-          correction_translation, correction_rotation, result_generation, coverage.p95_m);
+          correction_translation, correction_rotation, result_generation, coverage.p95_m, false,
+          "tracking input expired: " + result_rejection_reason);
       }
       RCLCPP_WARN(
         get_logger(), "Dropping completed GICP result generation=%" PRIu64
@@ -1112,10 +1839,35 @@ private:
       if (generationIsAppliedLocked(result_generation) &&
         can_update_preview)
       {
-        preview_map_odom_ = preview_map_odom;
-        has_last_map_odom_ = true;
+        if (!has_trusted_map_odom_) {
+          preview_map_odom_ = preview_map_odom;
+        }
+        status_detail_ = "GICP candidate preview; awaiting validation/continuity";
         preview_updated = true;
       }
+    }
+    if (preview_candidate_available) {
+      const Eigen::Isometry3d candidate_map_body = preview_map_odom * odom_body_eigen;
+      geometry_msgs::msg::PoseStamped candidate_pose;
+      candidate_pose.header.stamp = stamp;
+      candidate_pose.header.frame_id = map_frame_;
+      candidate_pose.pose.position.x = candidate_map_body.translation().x();
+      candidate_pose.pose.position.y = candidate_map_body.translation().y();
+      candidate_pose.pose.position.z = candidate_map_body.translation().z();
+      const Eigen::Quaterniond candidate_rotation(candidate_map_body.rotation());
+      candidate_pose.pose.orientation.x = candidate_rotation.x();
+      candidate_pose.pose.orientation.y = candidate_rotation.y();
+      candidate_pose.pose.orientation.z = candidate_rotation.z();
+      candidate_pose.pose.orientation.w = candidate_rotation.w();
+      {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (generationIsAppliedLocked(result_generation)) {
+          latest_candidate_pose_ = candidate_pose;
+          has_latest_candidate_pose_ = true;
+          latest_candidate_generation_ = result_generation;
+        }
+      }
+      candidate_pose_publisher_->publish(candidate_pose);
     }
     if (preview_updated) {
       RCLCPP_INFO_THROTTLE(
@@ -1192,6 +1944,13 @@ private:
         add_failure("multistart_yaw_spread", multistart_yaw_gate);
       }
       add_failure("multistart_consistency", multistart_gate);
+      {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        if (generationIsAppliedLocked(result_generation)) {
+          status_detail_ = "registration rejected: " + failed_gates;
+        }
+      }
+      saveOfflineSnapshotIfRequested("match_rejected", stamp);
       RCLCPP_WARN(
         get_logger(),
         "Rejecting GICP generation=%" PRIu64 " processing_elapsed=%.1fms "
@@ -1239,7 +1998,8 @@ private:
         alternate_correction_rotation);
       markRegistrationFailure(stamp, result.num_inliers, inlier_ratio, coverage.rmse_m,
         correction_translation, correction_rotation, result_generation, coverage.p95_m,
-        tracking_mode && (!tracking_translation_gate || !tracking_rotation_gate));
+        tracking_mode && (!tracking_translation_gate || !tracking_rotation_gate),
+        "GICP quality gates failed: " + failed_gates);
       return;
     }
 
@@ -1269,7 +2029,8 @@ private:
         "health is false or stale",
         result_generation, registration_elapsed_ms);
       markRegistrationFailure(stamp, result.num_inliers, inlier_ratio, coverage.rmse_m,
-        correction_translation, correction_rotation, result_generation, coverage.p95_m);
+        correction_translation, correction_rotation, result_generation, coverage.p95_m, false,
+        "FAST-LIO health is false or stale");
       return;
     }
 
@@ -1282,10 +2043,13 @@ private:
       uint32_t confirmation_count = 0;
       double candidate_spread_translation = 0.0;
       double candidate_spread_rotation = 0.0;
+      // Compare map->odom candidates in the shared map/odom frames. Comparing
+      // map->body deltas here makes a fixed correction appear to vary as the
+      // robot moves or rotates between scans.
       const Eigen::Vector3d candidate_translation_delta =
-        map_body.translation() - predicted_map_body.translation();
+        map_odom.translation() - predicted_map_odom.translation();
       Eigen::Quaterniond candidate_rotation_delta(
-        map_body.rotation() * predicted_map_body.rotation().transpose());
+        map_odom.rotation() * predicted_map_odom.rotation().transpose());
       candidate_rotation_delta.normalize();
       {
         std::lock_guard<std::mutex> lock(state_mutex_);
@@ -1322,6 +2086,7 @@ private:
             correction_confirmed = confirmation_count >=
               static_cast<uint32_t>(tracking_consistency_frames_required_);
             if (!correction_confirmed) {
+              status_detail_ = "tracking candidate awaiting consecutive confirmation";
               publishStatusLocked(stamp, result.num_inliers, inlier_ratio, coverage.rmse_m,
                 correction_translation, correction_rotation, coverage.sectors, coverage.ratio,
                 multistart_consistent, coverage.p95_m);
@@ -1337,10 +2102,11 @@ private:
         return;
       }
       if (!correction_confirmed) {
+        saveOfflineSnapshotIfRequested("tracking_candidate_pending", stamp);
         RCLCPP_WARN_THROTTLE(
           get_logger(), *get_clock(), static_cast<uint64_t>(timing_log_period_ms_),
           "Holding tracking correction pending consecutive confirmation count=%u/%d "
-          "correction=(%.3fm, %.4frad) previous_candidate_spread=(%.3fm, %.4frad)",
+          "correction=(%.3fm, %.4frad) previous_map_to_odom_candidate_spread=(%.3fm, %.4frad)",
           confirmation_count, tracking_consistency_frames_required_, correction_translation,
           correction_rotation, candidate_spread_translation, candidate_spread_rotation);
         return;
@@ -1449,13 +2215,22 @@ private:
           }
           relocalization_state_ = small_gicp_relocalization::msg::RelocalizationStatus::LOCALIZED;
           manual_seed_active_ = false;
+          candidate_source_ = candidate_source_ == "manual" ? "manual_verified" :
+            "bbs3d_verified";
+          status_detail_ = "localized; verified transform accepted";
+          has_automatic_recovery_start_wall_time_ = false;
         } else {
           relocalization_state_ = small_gicp_relocalization::msg::RelocalizationStatus::VERIFYING;
+          status_detail_ = "candidate accepted; waiting for consecutive verification";
         }
         if (relocalization_state_ ==
           small_gicp_relocalization::msg::RelocalizationStatus::LOCALIZED)
         {
           preview_map_odom_ = map_odom;
+          last_trusted_map_odom_ = map_odom;
+          has_trusted_map_odom_ = true;
+          last_trusted_success_wall_time_ = std::chrono::steady_clock::now();
+          has_last_trusted_success_wall_time_ = true;
           is_localized = true;
           accepted_localization_epoch = localization_epoch_;
         } else if (preview_candidate_available) {
@@ -1482,12 +2257,14 @@ private:
     }
     if (final_result_stale) {
       markRegistrationFailure(stamp, result.num_inliers, inlier_ratio, coverage.rmse_m,
-        correction_translation, correction_rotation, result_generation, coverage.p95_m);
+        correction_translation, correction_rotation, result_generation, coverage.p95_m, false,
+        "matching input expired before commit");
       return;
     }
     if (final_fastlio_unhealthy) {
       markRegistrationFailure(stamp, result.num_inliers, inlier_ratio, coverage.rmse_m,
-        correction_translation, correction_rotation, result_generation, coverage.p95_m);
+        correction_translation, correction_rotation, result_generation, coverage.p95_m, false,
+        "FAST-LIO health expired before commit");
       return;
     }
 
@@ -1499,6 +2276,7 @@ private:
       target.localization_epoch = accepted_localization_epoch;
       handoff_publisher_->publish(target);
       if (became_localized) {
+        saveOfflineSnapshotIfRequested("normal_localized", stamp);
         RCLCPP_INFO(
           get_logger(), "Initial accepted localization published on %s", handoff_topic_.c_str());
       } else {
@@ -1603,9 +2381,8 @@ private:
         has_accepted_pose_)
       {
         cleared = clearPendingTrackingCandidateLocked();
-        if (cleared) {
-          publishStatusLocked(now());
-        }
+        status_detail_ = std::string("input expired/skipped: ") + reason;
+        publishStatusLocked(now());
       }
     }
     if (cleared) {
@@ -1619,45 +2396,83 @@ private:
     const rclcpp::Time & stamp, std::size_t num_inliers = 0, double inlier_ratio = 0.0,
     double geometry_rmse_m = 0.0, double correction_translation = 0.0,
     double correction_rotation = 0.0, std::uint64_t generation = 0,
-    double geometry_p95_m = 0.0, bool immediate_loss = false)
+    double geometry_p95_m = 0.0, bool immediate_loss = false,
+    const std::string & failure_detail = "")
   {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    if (generation != 0 && !generationIsAppliedLocked(generation)) {
-      return;
-    }
-    if (!has_initial_pose_) return;
-    clearPendingTrackingCandidateLocked();
-    consecutive_successes_ = 0;
-    stable_map_odom_.clear();
-    has_stable_sequence_start_ = false;
-    if (!map_ready_.load(std::memory_order_acquire)) {
-      relocalization_state_ = small_gicp_relocalization::msg::RelocalizationStatus::MAP_LOADING;
-    } else if (relocalization_state_ ==
-      small_gicp_relocalization::msg::RelocalizationStatus::LOCALIZED)
+    bool changed = false;
+    bool entered_lost = false;
+    bool manual_candidate_failed = false;
     {
-      ++consecutive_failures_;
-      const double elapsed_since_success = has_success_wall_time_
-        ? std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - last_success_wall_time_).count()
-        : std::numeric_limits<double>::infinity();
-      if (immediate_loss || !small_gicp_relocalization::localizedFailureKeepsValidity(
-          consecutive_failures_, static_cast<std::uint32_t>(max_consecutive_failures_),
-          elapsed_since_success, validity_timeout_sec_))
-      {
-        relocalization_state_ = small_gicp_relocalization::msg::RelocalizationStatus::LOST;
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      if (generation != 0 && !generationIsAppliedLocked(generation)) {
+        return;
       }
-    } else if (relocalization_state_ !=
-      small_gicp_relocalization::msg::RelocalizationStatus::LOST)
-    {
-      relocalization_state_ = has_initial_pose_
-        ? small_gicp_relocalization::msg::RelocalizationStatus::VERIFYING
-        : small_gicp_relocalization::msg::RelocalizationStatus::WAITING_INITIAL_POSE;
+      if (!has_initial_pose_) return;
+      clearPendingTrackingCandidateLocked();
+      consecutive_successes_ = 0;
+      stable_map_odom_.clear();
+      has_stable_sequence_start_ = false;
+      if (!map_ready_.load(std::memory_order_acquire)) {
+        relocalization_state_ = small_gicp_relocalization::msg::RelocalizationStatus::MAP_LOADING;
+      } else if (relocalization_state_ ==
+        small_gicp_relocalization::msg::RelocalizationStatus::LOCALIZED)
+      {
+        ++consecutive_failures_;
+        const double elapsed_since_success = has_success_wall_time_
+          ? std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - last_success_wall_time_).count()
+          : std::numeric_limits<double>::infinity();
+        if (immediate_loss || !small_gicp_relocalization::localizedFailureKeepsValidity(
+            consecutive_failures_, static_cast<std::uint32_t>(max_consecutive_failures_),
+            elapsed_since_success, validity_timeout_sec_))
+        {
+          relocalization_state_ = small_gicp_relocalization::msg::RelocalizationStatus::LOST;
+        }
+      } else if (relocalization_state_ !=
+        small_gicp_relocalization::msg::RelocalizationStatus::LOST)
+      {
+        const bool geometric_manual_rejection = manual_seed_active_ &&
+          (failure_detail.rfind("GICP quality gates failed", 0) == 0 ||
+          failure_detail.rfind("too few source points", 0) == 0);
+        if (geometric_manual_rejection) {
+          ++consecutive_failures_;
+          if (consecutive_failures_ >= static_cast<std::uint32_t>(max_consecutive_failures_)) {
+            relocalization_state_ = small_gicp_relocalization::msg::RelocalizationStatus::LOST;
+            manual_candidate_failed = true;
+          } else {
+            relocalization_state_ = small_gicp_relocalization::msg::RelocalizationStatus::VERIFYING;
+          }
+        } else {
+          relocalization_state_ = has_initial_pose_
+            ? small_gicp_relocalization::msg::RelocalizationStatus::VERIFYING
+            : small_gicp_relocalization::msg::RelocalizationStatus::WAITING_INITIAL_POSE;
+        }
+      }
+      if (relocalization_state_ == small_gicp_relocalization::msg::RelocalizationStatus::LOST) {
+        has_success_wall_time_ = false;
+        status_detail_ = failure_detail.empty()
+          ? "localization lost after registration failure"
+          : "localization lost after: " + failure_detail;
+        candidate_source_ = manual_seed_active_ ? "manual_failed" : "automatic_recovery";
+        if (!manual_seed_active_ && !has_automatic_recovery_start_wall_time_) {
+          automatic_recovery_start_wall_time_ = std::chrono::steady_clock::now();
+          has_automatic_recovery_start_wall_time_ = true;
+        }
+        entered_lost = true;
+      } else {
+        status_detail_ = failure_detail.empty()
+          ? "registration failed; last trusted transform retained"
+          : "last trusted transform retained; " + failure_detail;
+      }
+      publishStatusLocked(stamp, num_inliers, inlier_ratio, geometry_rmse_m, correction_translation,
+        correction_rotation, 0, 0.0, false, geometry_p95_m);
+      changed = true;
     }
-    if (relocalization_state_ == small_gicp_relocalization::msg::RelocalizationStatus::LOST) {
-      has_success_wall_time_ = false;
+    if (changed) saveOfflineSnapshotIfRequested("registration_failure", stamp);
+    if (entered_lost) saveOfflineSnapshotIfRequested("lost", stamp);
+    if (manual_candidate_failed) {
+      cancelManualSeedAndResumeAuto("repeated GICP quality rejection", true);
     }
-    publishStatusLocked(stamp, num_inliers, inlier_ratio, geometry_rmse_m, correction_translation,
-      correction_rotation, 0, 0.0, false, geometry_p95_m);
   }
 
   static double yaw(const Eigen::Isometry3d & transform)
@@ -1776,6 +2591,57 @@ private:
     status.correction_translation = correction_translation;
     status.correction_rotation = correction_rotation;
     status.last_success_time = last_success_stamp_;
+    status.candidate_source = candidate_source_;
+    status.state_detail = status_detail_;
+    status.last_trusted_pose_age_sec = has_last_trusted_success_wall_time_
+      ? std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - last_trusted_success_wall_time_).count()
+      : -1.0;
+    if (manual_seed_active_) {
+      const auto current = std::chrono::steady_clock::now();
+      const double elapsed_since_received = std::chrono::duration<double>(
+        current - manual_seed_received_wall_time_).count();
+      const double elapsed_since_usable_cloud = has_verification_start_wall_time_
+        ? std::chrono::duration<double>(current - verification_start_wall_time_).count() : 0.0;
+      const auto deadline_state = small_gicp_relocalization::manualSeedDeadlineState(
+        true, has_verification_start_wall_time_, elapsed_since_received,
+        elapsed_since_usable_cloud, manual_seed_input_timeout_sec_,
+        manual_seed_validation_timeout_sec_);
+      status.manual_seed_time_remaining_sec = deadline_state ==
+        small_gicp_relocalization::ManualSeedDeadlineState::WAITING_FOR_INPUT
+        ? std::max(0.0, manual_seed_input_timeout_sec_ - elapsed_since_received)
+        : (deadline_state == small_gicp_relocalization::ManualSeedDeadlineState::VALIDATING
+        ? std::max(0.0, manual_seed_validation_timeout_sec_ - elapsed_since_usable_cloud) : 0.0);
+    } else {
+      status.manual_seed_time_remaining_sec = 0.0;
+    }
+    status.map_point_count = static_cast<uint32_t>(std::min<std::size_t>(
+        map_cloud_ ? map_cloud_->size() : 0, UINT32_MAX));
+    status.source_point_count = static_cast<uint32_t>(std::min<std::size_t>(
+        last_snapshot_cloud_ ? last_snapshot_cloud_->size() : 0, UINT32_MAX));
+    status.point_cloud_age_sec = -1.0;
+    if (last_snapshot_stamp_ns_ > 0) {
+      try {
+        const rclcpp::Time cloud_stamp(last_snapshot_stamp_ns_, get_clock()->get_clock_type());
+        status.point_cloud_age_sec = std::max(0.0, (stamp - cloud_stamp).seconds());
+      } catch (const std::exception &) {
+        status.point_cloud_age_sec = -1.0;
+      }
+    }
+    status.tf_wait_sec = latest_tf_wait_sec_;
+    status.matching_duration_ms = latest_match_duration_ms_;
+    status.consecutive_failures = consecutive_failures_;
+    status.pending_candidate_confirmations = pending_tracking_candidate_count_;
+    status.automatic_recovery_active = !manual_seed_active_ &&
+      relocalization_state_ == small_gicp_relocalization::msg::RelocalizationStatus::LOST;
+    status.automatic_recovery_elapsed_sec = status.automatic_recovery_active &&
+      has_automatic_recovery_start_wall_time_
+      ? std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - automatic_recovery_start_wall_time_).count()
+      : 0.0;
+    if (num_inliers > 0 || geometry_rmse_m > 0.0 || geometry_p95_m > 0.0) {
+      last_match_status_ = status;
+    }
     status_publisher_->publish(status);
   }
 
@@ -1785,10 +2651,27 @@ private:
     const auto heartbeat_stamp = now();
     Eigen::Isometry3d map_odom = Eigen::Isometry3d::Identity();
     bool timed_out = false;
+    bool manual_seed_timed_out = false;
+    std::string timeout_reason;
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
       if (!map_ready_.load(std::memory_order_acquire)) {
         relocalization_state_ = small_gicp_relocalization::msg::RelocalizationStatus::MAP_LOADING;
+      } else if (manual_seed_active_) {
+        const auto current = std::chrono::steady_clock::now();
+        const double elapsed_since_received = std::chrono::duration<double>(
+          current - manual_seed_received_wall_time_).count();
+        const double elapsed_since_usable_cloud = has_verification_start_wall_time_
+          ? std::chrono::duration<double>(current - verification_start_wall_time_).count() : 0.0;
+        const auto deadline_state = small_gicp_relocalization::manualSeedDeadlineState(
+          true, has_verification_start_wall_time_, elapsed_since_received,
+          elapsed_since_usable_cloud, manual_seed_input_timeout_sec_,
+          manual_seed_validation_timeout_sec_);
+        if (deadline_state == small_gicp_relocalization::ManualSeedDeadlineState::EXPIRED) {
+          manual_seed_timed_out = true;
+          timeout_reason = has_verification_start_wall_time_ ? "GICP validation deadline expired" :
+            "TF/input wait deadline expired";
+        }
       } else if (has_initial_pose_ && !has_pending_initial_pose_ &&
         has_verification_start_wall_time_) {
         const auto reference = has_success_wall_time_
@@ -1807,18 +2690,33 @@ private:
           consecutive_failures_ = 0;
           has_success_wall_time_ = false;
           clearPendingTrackingCandidateLocked();
+          status_detail_ = "localization validity expired; automatic relocalization available";
+          candidate_source_ = "automatic_recovery";
+          automatic_recovery_start_wall_time_ = std::chrono::steady_clock::now();
+          has_automatic_recovery_start_wall_time_ = true;
           timed_out = true;
         }
       }
       map_odom = preview_map_odom_;
       publishStatusLocked(heartbeat_stamp);
-      preview_map_odom_publisher_->publish(
-        toTransform(map_odom, map_frame_, odom_frame_, heartbeat_stamp));
+      if (has_trusted_map_odom_ || has_initial_pose_) {
+        preview_map_odom_publisher_->publish(
+          toTransform(map_odom, map_frame_, odom_frame_, heartbeat_stamp));
+      }
+    }
+    if (manual_seed_timed_out) {
+      RCLCPP_ERROR(
+        get_logger(), "Manual seed failed: %s after input_wait=%.1fs validation=%.1fs; "
+        "releasing BBS and returning to automatic relocalization",
+        timeout_reason.c_str(), manual_seed_input_timeout_sec_,
+        manual_seed_validation_timeout_sec_);
+      cancelManualSeedAndResumeAuto(timeout_reason.c_str(), true);
     }
     if (timed_out) {
       RCLCPP_WARN(
         get_logger(), "Relocalization validity timed out after %.1f seconds; entering LOST",
         validity_timeout_sec_);
+      saveOfflineSnapshotIfRequested("lost", heartbeat_stamp);
     }
   }
 
@@ -1839,6 +2737,8 @@ private:
   std::string map_frame_;
   std::string odom_frame_;
   std::string body_frame_;
+  std::string base_frame_;
+  std::string odometry_topic_;
   double registration_voxel_size_;
   double tracking_input_voxel_size_;
   double display_voxel_size_;
@@ -1876,8 +2776,14 @@ private:
   double validity_timeout_sec_;
   int max_consecutive_failures_;
   double tf_lookup_timeout_sec_;
+  double manual_seed_input_timeout_sec_;
+  double manual_seed_validation_timeout_sec_;
+  double manual_seed_bbs_height_max_age_sec_;
   int timing_log_period_ms_;
   std::string offline_snapshot_dir_;
+  int offline_snapshot_max_count_{8};
+  std::string navigation_map_file_;
+  std::string startup_context_;
   std::string handoff_topic_;
   bool exit_after_localized_{false};
   std::string fastlio_health_topic_;
@@ -1892,6 +2798,10 @@ private:
   bool has_pending_tracking_candidate_{false};
   bool pending_pose_is_map_body_{false};
   bool has_bbs_seed_time_{false};
+  bool has_trusted_map_odom_{false};
+  bool has_last_trusted_success_wall_time_{false};
+  bool has_latest_bbs_pose_{false};
+  bool have_static_tf_snapshot_{false};
   builtin_interfaces::msg::Time pending_pose_stamp_{};
   std::chrono::steady_clock::time_point last_bbs_seed_time_{};
   uint8_t relocalization_state_{small_gicp_relocalization::msg::RelocalizationStatus::MAP_LOADING};
@@ -1907,12 +2817,12 @@ private:
   bool has_verification_start_wall_time_{false};
   bool has_multistart_validation_{false};
   bool last_multistart_consistent_{false};
-  bool snapshot_saved_{false};
   bool has_tracking_attempt_wall_time_{false};
   bool has_fastlio_health_{false};
   bool fastlio_healthy_{false};
-  std::chrono::steady_clock::time_point last_initialization_wall_time_{};
+  std::chrono::steady_clock::time_point manual_seed_received_wall_time_{};
   std::chrono::steady_clock::time_point last_success_wall_time_{};
+  std::chrono::steady_clock::time_point last_trusted_success_wall_time_{};
   std::chrono::steady_clock::time_point last_tracking_attempt_wall_time_{};
   std::chrono::steady_clock::time_point verification_start_wall_time_{};
   std::chrono::steady_clock::time_point stable_sequence_start_{};
@@ -1920,15 +2830,46 @@ private:
   builtin_interfaces::msg::Time last_success_stamp_{};
   std::deque<Eigen::Isometry3d> stable_map_odom_;
   std::deque<std::pair<int64_t, Eigen::Isometry3d>> odom_body_history_;
+  std::deque<nav_msgs::msg::Odometry> odometry_history_;
+  std::deque<tf2_msgs::msg::TFMessage> dynamic_tf_history_;
+  small_gicp_relocalization::RecentSnapshotEventCache snapshot_events_saved_{
+    small_gicp_relocalization::kSnapshotEventCacheCapacity};
+  std::uint64_t snapshot_sequence_{0};
+  std::uint64_t last_snapshot_generation_{0};
+  int64_t last_snapshot_stamp_ns_{0};
+  bool last_snapshot_has_odom_{false};
+  pcl::PointCloud<pcl::PointXYZ>::ConstPtr last_snapshot_cloud_;
+  Eigen::Isometry3d last_snapshot_odom_body_{Eigen::Isometry3d::Identity()};
   geometry_msgs::msg::Pose pending_initial_pose_;
   geometry_msgs::msg::Pose seed_initial_pose_;
+  geometry_msgs::msg::PoseStamped latest_candidate_pose_;
+  bool has_latest_candidate_pose_{false};
+  std::uint64_t latest_candidate_generation_{0};
+  small_gicp_relocalization::msg::RelocalizationStatus last_match_status_;
+  std::array<double, 36> seed_initial_pose_covariance_{};
+  bool seed_initial_pose_is_map_body_{false};
+  geometry_msgs::msg::Pose latest_bbs_pose_;
+  builtin_interfaces::msg::Time latest_bbs_pose_stamp_{};
+  std::string candidate_source_{"automatic"};
+  std::string status_detail_{"waiting for initial pose"};
   Eigen::Isometry3d initial_map_odom_{Eigen::Isometry3d::Identity()};
   Eigen::Isometry3d preview_map_odom_{Eigen::Isometry3d::Identity()};
   Eigen::Isometry3d last_map_odom_{Eigen::Isometry3d::Identity()};
+  Eigen::Isometry3d last_trusted_map_odom_{Eigen::Isometry3d::Identity()};
   Eigen::Vector3d pending_tracking_translation_delta_{Eigen::Vector3d::Zero()};
   Eigen::Quaterniond pending_tracking_rotation_delta_{Eigen::Quaterniond::Identity()};
   std::chrono::steady_clock::time_point last_fastlio_health_wall_time_{};
+  std::chrono::steady_clock::time_point automatic_recovery_start_wall_time_{};
+  bool has_automatic_recovery_start_wall_time_{false};
+  double latest_tf_wait_sec_{0.0};
+  double latest_match_duration_ms_{0.0};
   std::mutex state_mutex_;
+  std::mutex snapshot_queue_mutex_;
+  std::condition_variable snapshot_queue_condition_;
+  std::deque<std::function<void()>> snapshot_queue_;
+  std::thread snapshot_worker_thread_;
+  bool snapshot_worker_stopping_{false};
+  small_gicp_relocalization::SnapshotRateLimiter snapshot_event_rate_limiter_;
 
   CovarianceCloud::Ptr map_cloud_;
   std::shared_ptr<CovarianceTree> map_tree_;
@@ -1938,6 +2879,9 @@ private:
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr initial_pose_subscription_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr bbs_global_pose_subscription_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr fastlio_health_subscription_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odometry_subscription_;
+  rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr dynamic_tf_subscription_;
+  rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr static_tf_subscription_;
   rclcpp::CallbackGroup::SharedPtr initial_pose_callback_group_;
   rclcpp::CallbackGroup::SharedPtr fastlio_health_callback_group_;
   rclcpp::CallbackGroup::SharedPtr heartbeat_callback_group_;
@@ -1945,11 +2889,14 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr prior_map_display_publisher_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr aligned_cloud_publisher_;
   rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_publisher_;
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr candidate_pose_publisher_;
   rclcpp::Publisher<geometry_msgs::msg::TransformStamped>::SharedPtr
     preview_map_odom_publisher_;
   rclcpp::Publisher<small_gicp_relocalization::msg::RelocalizationStatus>::SharedPtr status_publisher_;
   rclcpp::Publisher<small_gicp_relocalization::msg::MapOdomTarget>::SharedPtr
     handoff_publisher_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr cancel_manual_seed_service_;
+  tf2_msgs::msg::TFMessage static_tf_snapshot_;
   rclcpp::CallbackGroup::SharedPtr map_load_callback_group_;
   rclcpp::TimerBase::SharedPtr heartbeat_timer_;
   rclcpp::TimerBase::SharedPtr map_load_timer_;

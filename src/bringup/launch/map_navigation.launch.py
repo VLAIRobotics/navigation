@@ -1,15 +1,36 @@
+import json
+import os
 import re
 import subprocess
 
+import yaml
+
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, LogInfo, OpaqueFunction, SetLaunchConfiguration
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PathJoinSubstitution, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
-from nav2_common.launch import RewrittenYaml
+from nav2_common.launch import RewrittenYaml as _RewrittenYaml
+
+
+class RewrittenYaml(_RewrittenYaml):
+    """Rewrite array elements and literal dotted ROS parameter names on Humble."""
+
+    def updateYamlPathVals(self, data, keys, value):
+        literal_key = ".".join(keys)
+        if isinstance(data, dict) and literal_key in data:
+            data[literal_key] = value
+            return data
+        key = int(keys[0]) if isinstance(data, list) else keys[0]
+        if len(keys) == 1:
+            data[key] = value
+        else:
+            data[key] = self.updateYamlPathVals(data[key], keys[1:], value)
+        return data
 
 
 def inspect_chassis_can_interface(output, returncode):
@@ -59,6 +80,27 @@ def validate_chassis_can_interface(context):
     return []
 
 
+def configure_chassis_model(context):
+    model = LaunchConfiguration("chassis_model").perform(context)
+    if model == "diff":
+        model = "two_wheel"
+    config_path = os.path.join(
+        get_package_share_directory("bringup"), "config", "chassis_models.yaml")
+    with open(config_path, "r", encoding="utf-8") as model_file:
+        models = yaml.safe_load(model_file)
+    if model not in models:
+        raise RuntimeError("chassis_model must be two_wheel or omni")
+    profile = models[model]
+    return [
+        SetLaunchConfiguration("chassis_model", model),
+        SetLaunchConfiguration("robot_footprint", json.dumps(profile["footprint"])),
+        SetLaunchConfiguration("robot_footprint_flat", json.dumps(profile["flat_footprint"])),
+        LogInfo(msg=(
+            f"Chassis model={model} footprint={profile['length']:.3f}x"
+            f"{profile['width']:.3f} m profile={config_path}")),
+    ]
+
+
 def generate_launch_description():
     map_yaml = LaunchConfiguration("map_yaml")
     params_file = LaunchConfiguration("params_file")
@@ -68,6 +110,8 @@ def generate_launch_description():
     saved_map_root = LaunchConfiguration("saved_map_root")
     map_source_id = LaunchConfiguration("map_source_id")
     display_pcd_file = LaunchConfiguration("display_pcd_file")
+    display_ground_cache_file = LaunchConfiguration("display_ground_cache_file")
+    display_structure_cache_file = LaunchConfiguration("display_structure_cache_file")
     display_max_height_above_ground = LaunchConfiguration("display_max_height_above_ground")
     local_cloud_radius = LaunchConfiguration("local_cloud_radius")
     local_ground_voxel_size = LaunchConfiguration("local_ground_voxel_size")
@@ -96,6 +140,13 @@ def generate_launch_description():
     robot_height = LaunchConfiguration("robot_height")
     clearance_margin = LaunchConfiguration("clearance_margin")
     enable_chassis = LaunchConfiguration("enable_chassis")
+    chassis_model = LaunchConfiguration("chassis_model")
+    robot_footprint = LaunchConfiguration("robot_footprint")
+    robot_footprint_flat = LaunchConfiguration("robot_footprint_flat")
+    omni_lateral_speed = PythonExpression([
+        "'0.15' if '", chassis_model, "' == 'omni' else '0.0'"])
+    omni_lateral_accel = PythonExpression([
+        "'0.30' if '", chassis_model, "' == 'omni' else '0.0'"])
     can_interface = LaunchConfiguration("can_interface")
     body_to_base_x = LaunchConfiguration("body_to_base_x")
     body_to_base_y = LaunchConfiguration("body_to_base_y")
@@ -246,9 +297,7 @@ def generate_launch_description():
             "diagnostic_cell_x": ParameterValue(diagnostic_cell_x, value_type=float),
             "diagnostic_cell_y": ParameterValue(diagnostic_cell_y, value_type=float),
             "base_frame": "base_link",
-            "robot_footprint": [
-                0.275, 0.225, 0.275, -0.225, -0.35, -0.225, -0.35, 0.225,
-            ],
+            "robot_footprint": ParameterValue(robot_footprint_flat),
             "use_sim_time": ParameterValue(use_sim_time, value_type=bool),
         }],
     )
@@ -293,9 +342,7 @@ def generate_launch_description():
             "terrain_slope_lethal_threshold": 35.0,
             "terrain_residual_step_lethal_threshold": 0.25,
             "terrain_roughness_lethal_threshold": 0.25,
-            "robot_footprint": [
-                0.275, 0.225, 0.275, -0.225, -0.35, -0.225, -0.35, 0.225,
-            ],
+            "robot_footprint": ParameterValue(robot_footprint_flat),
             "min_frontier_cells": 4,
             "search_period": 2.0,
             "tf_timeout": 0.10,
@@ -314,6 +361,8 @@ def generate_launch_description():
         parameters=[{
             "terrain_map_file": terrain_map_file,
             "display_pcd_file": display_pcd_file,
+            "display_ground_cache_file": display_ground_cache_file,
+            "display_structure_cache_file": display_structure_cache_file,
             "ground_display_voxel_size": 0.12,
             "display_max_height_above_ground": ParameterValue(
                 display_max_height_above_ground, value_type=float),
@@ -377,6 +426,23 @@ def generate_launch_description():
                         clearance_margin,
                     "global_costmap.global_costmap.ros__parameters.static_terrain_layer.terrain_map_file":
                         terrain_map_file,
+                    "global_costmap.global_costmap.ros__parameters.footprint": robot_footprint,
+                    "local_costmap.local_costmap.ros__parameters.footprint": robot_footprint,
+                    "controller_server.ros__parameters.FollowPath.footprint_model.vertices":
+                        robot_footprint,
+                    "controller_server.ros__parameters.FollowPath.max_vel_y":
+                        omni_lateral_speed,
+                    "controller_server.ros__parameters.FollowPath.acc_lim_y":
+                        omni_lateral_accel,
+                    "velocity_smoother.ros__parameters.max_velocity.1": omni_lateral_speed,
+                    "velocity_smoother.ros__parameters.min_velocity.1": PythonExpression([
+                        "'-0.15' if '", chassis_model, "' == 'omni' else '0.0'"]),
+                    "velocity_smoother.ros__parameters.max_accel.1": omni_lateral_accel,
+                    "velocity_smoother.ros__parameters.max_decel.1": PythonExpression([
+                        "'-0.30' if '", chassis_model, "' == 'omni' else '0.0'"]),
+                    "local_costmap.local_costmap.ros__parameters.inflation_layer.inflation_radius":
+                        PythonExpression([
+                            "'0.55' if '", chassis_model, "' == 'omni' else '0.25'"]),
                 },
                 convert_types=True,
             ),
@@ -393,6 +459,7 @@ def generate_launch_description():
         output="screen",
         condition=IfCondition(enable_chassis),
         parameters=[{
+            "chassis_model": chassis_model,
             "cmd_vel_topic": "/cmd_vel",
             "can_interface": can_interface,
             "can_id": 80,
@@ -420,6 +487,8 @@ def generate_launch_description():
             "terrain_residual_step_lethal_threshold": 0.25,
             "terrain_roughness_lethal_threshold": 0.25,
             "require_reverse_costmap": True,
+            "require_motion_costmap": True,
+            "motion_costmap_topic": "/local_costmap/costmap_raw",
             "reverse_costmap_topic": "/local_costmap/costmap_raw",
             "reverse_costmap_timeout": 0.75,
             "reverse_odometry_timeout": 0.4,
@@ -431,11 +500,10 @@ def generate_launch_description():
             "reverse_motion_threshold": 0.05,
             "reverse_confirmation_samples": 3,
             "reverse_latch_reset_cycles": 20,
-            "reverse_unknown_is_blocked": False,
-            "reverse_block_cost": 254,
-            "reverse_footprint": [
-                0.275, 0.225, 0.275, -0.225, -0.35, -0.225, -0.35, 0.225,
-            ],
+            "reverse_unknown_is_blocked": True,
+            "reverse_block_cost": 253,
+            "motion_footprint": ParameterValue(robot_footprint_flat),
+            "reverse_footprint": ParameterValue(robot_footprint_flat),
             "use_sim_time": ParameterValue(use_sim_time, value_type=bool),
         }],
     )
@@ -568,6 +636,14 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "display_pcd_file", default_value="",
             description="可选的降采样静态 PCD 调试显示缓存路径；默认画面不加载",
+        ),
+        DeclareLaunchArgument(
+            "display_ground_cache_file", default_value="",
+            description="可选的预分类静态 PCD 地面显示缓存",
+        ),
+        DeclareLaunchArgument(
+            "display_structure_cache_file", default_value="",
+            description="可选的预分类、预索引静态 PCD 结构缓存",
         ),
         DeclareLaunchArgument(
             "display_max_height_above_ground", default_value="1.2",
@@ -708,12 +784,16 @@ def generate_launch_description():
             description="是否启用在线局部 FastDEM 地形代价层；可传 false 关闭",
         ),
         DeclareLaunchArgument("enable_chassis", default_value="true"),
+        DeclareLaunchArgument(
+            "chassis_model", default_value="two_wheel",
+            description="共享车身模型：two_wheel 或 omni"),
         DeclareLaunchArgument("can_interface", default_value="can3"),
         DeclareLaunchArgument("body_to_base_x", default_value="-0.098346"),
         DeclareLaunchArgument("body_to_base_y", default_value="0.004472"),
         DeclareLaunchArgument("body_to_base_yaw", default_value="0.0"),
         DeclareLaunchArgument("body_to_base_roll", default_value=""),
         DeclareLaunchArgument("body_to_base_pitch", default_value=""),
+        OpaqueFunction(function=configure_chassis_model),
         OpaqueFunction(function=validate_chassis_can_interface),
         patchworkpp_node,
         fastdem_node,

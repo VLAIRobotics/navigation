@@ -50,6 +50,16 @@ public:
   ChassisDriverNode()
   : Node("chassis_driver"), tf_buffer_(get_clock())
   {
+    declare_parameter("chassis_model", "two_wheel");
+    chassis_model_ = get_parameter("chassis_model").as_string();
+    if (chassis_model_ != "two_wheel" && chassis_model_ != "omni") {
+      throw std::invalid_argument("chassis_model must be two_wheel or omni");
+    }
+    if (chassis_model_ == "omni") {
+      throw std::runtime_error(
+        "Refusing to open CAN for chassis_model=omni: the lateral-velocity CAN field, "
+        "direction, and scale have not been verified; use enable_chassis:=false until verified");
+    }
     declare_parameter("cmd_vel_topic", "/cmd_vel");
     declare_parameter("can_interface", "can3");
     declare_parameter("can_id", 0x050);
@@ -83,6 +93,8 @@ public:
     declare_parameter("terrain_slope_lethal_threshold", 30.0);
     declare_parameter("terrain_residual_step_lethal_threshold", 0.15);
     declare_parameter("terrain_roughness_lethal_threshold", 0.15);
+    declare_parameter("require_motion_costmap", false);
+    declare_parameter("motion_costmap_topic", "/local_costmap/costmap_raw");
     declare_parameter("require_reverse_costmap", false);
     declare_parameter("reverse_costmap_topic", "/local_costmap/costmap_raw");
     declare_parameter("reverse_blocked_topic", "/chassis/reverse_blocked");
@@ -100,6 +112,8 @@ public:
     declare_parameter("reverse_unknown_is_blocked", false);
     declare_parameter("reverse_block_cost", 253);
     declare_parameter("reverse_footprint", std::vector<double>{
+        0.275, 0.225, 0.275, -0.225, -0.35, -0.225, -0.35, 0.225});
+    declare_parameter("motion_footprint", std::vector<double>{
         0.275, 0.225, 0.275, -0.225, -0.35, -0.225, -0.35, 0.225});
 
     bringup::ChassisConfig config;
@@ -128,7 +142,8 @@ public:
     require_relocalization_ = get_parameter("require_relocalization").as_bool();
     relocalization_timeout_ = get_parameter("relocalization_timeout").as_double();
     require_navigation_ready_ = get_parameter("require_navigation_ready").as_bool();
-    require_reverse_costmap_ = get_parameter("require_reverse_costmap").as_bool();
+    require_reverse_costmap_ = get_parameter("require_motion_costmap").as_bool() ||
+      get_parameter("require_reverse_costmap").as_bool();
     reverse_costmap_timeout_ = get_parameter("reverse_costmap_timeout").as_double();
     reverse_odometry_timeout_ = get_parameter("reverse_odometry_timeout").as_double();
     reverse_base_frame_ = get_parameter("reverse_base_frame").as_string();
@@ -141,7 +156,14 @@ public:
     reverse_latch_reset_cycles_ = get_parameter("reverse_latch_reset_cycles").as_int();
     reverse_unknown_is_blocked_ = get_parameter("reverse_unknown_is_blocked").as_bool();
     reverse_block_cost_ = get_parameter("reverse_block_cost").as_int();
-    const auto reverse_footprint = get_parameter("reverse_footprint").as_double_array();
+    auto reverse_footprint = get_parameter("motion_footprint").as_double_array();
+    if (get_parameter("reverse_footprint").as_double_array() !=
+      std::vector<double>{0.275, 0.225, 0.275, -0.225, -0.35, -0.225, -0.35, 0.225})
+    {
+      // Preserve explicit settings from older launch files while the parameter
+      // name moves from the reverse-only gate to the shared motion gate.
+      reverse_footprint = get_parameter("reverse_footprint").as_double_array();
+    }
     if (reverse_footprint.size() < 6 || reverse_footprint.size() % 2 != 0) {
       throw std::invalid_argument("reverse_footprint must contain at least three x/y vertices");
     }
@@ -190,9 +212,6 @@ public:
     {
       throw std::invalid_argument("reverse costmap safety parameters are invalid");
     }
-    reverse_motion_latch_ = bringup::ReverseMotionLatch(
-      static_cast<std::size_t>(reverse_latch_reset_cycles_));
-
     if (require_reverse_costmap_) {
       tf_listener_ = std::make_shared<tf2_ros::TransformListener>(tf_buffer_, this);
     }
@@ -224,7 +243,10 @@ public:
       topic, 10, [this](const geometry_msgs::msg::Twist::SharedPtr msg) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!state_->update(*msg, std::chrono::steady_clock::now())) {
-          RCLCPP_WARN(get_logger(), "Ignoring invalid /cmd_vel and stopping chassis");
+          RCLCPP_ERROR(
+            get_logger(),
+            "Rejected invalid or unsupported /cmd_vel component (including linear.y); "
+            "stopping chassis and latching the safety fault");
         }
       });
     odometry_subscription_ = create_subscription<nav_msgs::msg::Odometry>(
@@ -264,7 +286,14 @@ public:
         have_obstacle_ = true;
       });
     if (require_reverse_costmap_) {
-      const auto reverse_costmap_topic = get_parameter("reverse_costmap_topic").as_string();
+      auto reverse_costmap_topic = get_parameter("motion_costmap_topic").as_string();
+      const auto legacy_reverse_costmap_topic =
+        get_parameter("reverse_costmap_topic").as_string();
+      if (reverse_costmap_topic == "/local_costmap/costmap_raw" &&
+        legacy_reverse_costmap_topic != "/local_costmap/costmap_raw")
+      {
+        reverse_costmap_topic = legacy_reverse_costmap_topic;
+      }
       reverse_costmap_subscription_ = create_subscription<nav2_msgs::msg::Costmap>(
         reverse_costmap_topic, rclcpp::QoS(1).reliable().transient_local(),
         [this](nav2_msgs::msg::Costmap::SharedPtr message) {
@@ -332,7 +361,10 @@ public:
     const auto period = std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::duration<double>(1.0 / config.send_rate));
     timer_ = create_wall_timer(period, [this]() { send_current(); });
-    RCLCPP_INFO(get_logger(), "xArm chassis driver using %s", interface_.c_str());
+    RCLCPP_INFO(
+      get_logger(), "Chassis model=%s footprint_vertices=%zu CAN=%s; swept-footprint "
+      "safety checks all commanded/measured planar motion",
+      chassis_model_.c_str(), reverse_footprint_.size(), interface_.c_str());
   }
 
   ~ChassisDriverNode() override
@@ -468,35 +500,11 @@ private:
     return true;
   }
 
-  bool reverseOdometryShowsBackwardMotionLocked(
-    const int64_t now_ros_ns, const std::chrono::steady_clock::time_point now,
-    bool & moving_backward, std::string & reason)
-  {
-    tf2::Vector3 linear_base;
-    tf2::Vector3 angular_base;
-    if (!measuredVelocityInBaseLocked(now_ros_ns, now, linear_base, angular_base, reason)) {
-      return false;
-    }
-    const auto stamp_ns = static_cast<int64_t>(reverse_odometry_->header.stamp.sec) *
-      1000000000LL + reverse_odometry_->header.stamp.nanosec;
-    if (stamp_ns != last_reverse_odometry_stamp_ns_) {
-      last_reverse_odometry_stamp_ns_ = stamp_ns;
-      if (linear_base.x() < -reverse_motion_threshold_) {
-        reverse_backward_sample_count_ = std::min(
-          reverse_backward_sample_count_ + 1, reverse_confirmation_samples_);
-      } else {
-        reverse_backward_sample_count_ = 0;
-      }
-    }
-    moving_backward = reverse_backward_sample_count_ >= reverse_confirmation_samples_;
-    return true;
-  }
-
-  bool reverseVelocityEnvelopeLocked(
+  bool motionVelocityEnvelopeLocked(
     const geometry_msgs::msg::Twist & command, const int64_t now_ros_ns,
     const std::chrono::steady_clock::time_point now,
     std::vector<std::pair<double, double>> & linear_velocities,
-    std::vector<double> & angular_velocities, bool & measured_backward,
+    std::vector<double> & angular_velocities, bool & reverse_motion,
     std::string & reason) const
   {
     tf2::Vector3 linear_base;
@@ -514,40 +522,35 @@ private:
       return false;
     }
 
-    measured_backward = linear_base.x() < -reverse_motion_threshold_;
+    reverse_motion = linear_base.x() < -reverse_motion_threshold_ ||
+      command.linear.x < -reverse_motion_threshold_;
     linear_velocities.clear();
-    if (command.linear.x < -reverse_motion_threshold_) {
-      linear_velocities.emplace_back(
-        -std::max(std::abs(command.linear.x), measured_linear_speed), 0.0);
-    } else if (command.linear.x > reverse_motion_threshold_) {
-      linear_velocities.emplace_back(command.linear.x, 0.0);
+    const double command_linear_speed = std::hypot(command.linear.x, command.linear.y);
+    if (command_linear_speed > reverse_motion_threshold_) {
+      linear_velocities.emplace_back(command.linear.x, command.linear.y);
     }
-    if (measured_linear_speed > 1e-6) {
+    if (measured_linear_speed > reverse_motion_threshold_) {
       linear_velocities.emplace_back(linear_base.x(), linear_base.y());
     }
     if (linear_velocities.empty()) {
       linear_velocities.emplace_back(0.0, 0.0);
     }
-    const double command_angular = command.angular.z;
-    const double max_angular = std::max(std::abs(command_angular), measured_angular_speed);
     angular_velocities.clear();
-    if (max_angular <= 1e-6) {
+    if (std::abs(command.angular.z) > reverse_motion_threshold_) {
+      angular_velocities.push_back(command.angular.z);
+    }
+    if (measured_angular_speed > reverse_motion_threshold_) {
+      angular_velocities.push_back(angular_base.z());
+    }
+    if (angular_velocities.empty()) {
       angular_velocities.push_back(0.0);
-    } else if (command_angular * angular_base.z() < 0.0) {
-      // During a direction change, check both turn directions until odometry settles.
-      angular_velocities.push_back(-max_angular);
-      angular_velocities.push_back(max_angular);
-    } else {
-      const double direction = std::abs(command_angular) >= measured_angular_speed
-        ? command_angular : angular_base.z();
-      angular_velocities.push_back(std::copysign(max_angular, direction));
     }
     return true;
   }
 
-  bool reverseCommandIsSafeLocked(
+  bool motionCommandIsSafeLocked(
     const geometry_msgs::msg::Twist & command, const int64_t now_ros_ns,
-    const std::chrono::steady_clock::time_point now, bool & measured_backward,
+    const std::chrono::steady_clock::time_point now, bool & reverse_motion,
     std::string & reason) const
   {
     if (!reverse_costmap_) {
@@ -624,9 +627,9 @@ private:
     const double resolution = metadata.resolution;
     std::vector<std::pair<double, double>> projection_linear_velocities;
     std::vector<double> projection_angular_velocities;
-    if (!reverseVelocityEnvelopeLocked(
+    if (!motionVelocityEnvelopeLocked(
         command, now_ros_ns, now, projection_linear_velocities,
-        projection_angular_velocities, measured_backward, reason))
+        projection_angular_velocities, reverse_motion, reason))
     {
       return false;
     }
@@ -770,7 +773,7 @@ private:
         if (!trajectory_is_clear(
             linear_velocity.first, linear_velocity.second, angular_velocity))
         {
-          reason = "reverse swept footprint intersects occupied or unknown costmap cells";
+          reason = "swept footprint intersects occupied or unknown costmap cells";
           return false;
         }
       }
@@ -1041,52 +1044,51 @@ private:
         }
         if (require_reverse_costmap_) {
           const auto command = state_->command(now);
-          const bool reverse_command_active =
-            state_->has_active_reverse_command(now, 0.0);
-          if (state_->has_active_reverse_command(now, reverse_motion_threshold_)) {
-            reverse_command_consecutive_cycles_ = std::min(
-              reverse_command_consecutive_cycles_ + 1, reverse_confirmation_samples_);
-          } else {
-            reverse_command_consecutive_cycles_ = 0;
-          }
-          const bool reverse_command_confirmed =
-            reverse_command_consecutive_cycles_ >= reverse_confirmation_samples_;
-          const bool was_latched = reverse_motion_latch_.active();
-          bool measured_backward = false;
-          if (!was_latched && !reverse_command_confirmed) {
-            std::string odometry_reason;
-            reverseOdometryShowsBackwardMotionLocked(
-              now_ros_ns, now, measured_backward, odometry_reason);
-          }
-          const bool forward_or_zero_command =
-            command.linear.x >= -reverse_motion_threshold_;
-          const bool reverse_gate_active = reverse_motion_latch_.update(
-            reverse_command_confirmed || (!was_latched && measured_backward),
-            forward_or_zero_command);
-          if (was_latched && !reverse_gate_active) {
-            reverse_backward_sample_count_ = 0;
-          }
-          if (bringup::reverse_safety_check_required(
-              reverse_command_active, reverse_gate_active))
+          bool measured_motion = false;
+          bool measured_reverse = false;
+          if (reverse_odometry_ && now - reverse_odometry_received_at_ <=
+            std::chrono::duration<double>(reverse_odometry_timeout_))
           {
-            std::string reason;
-            measured_backward = false;
-            if (!reverseCommandIsSafeLocked(
-                command, now_ros_ns, now, measured_backward, reason))
+            const auto & measured = reverse_odometry_->twist.twist;
+            if (std::isfinite(measured.linear.x) && std::isfinite(measured.linear.y) &&
+              std::isfinite(measured.angular.z))
             {
-              state_->block_reverse_motion();
-              reverse_safety_trip_latch_.trip(now);
+              geometry_msgs::msg::Twist measured_twist;
+              measured_twist.linear.x = measured.linear.x;
+              measured_twist.linear.y = measured.linear.y;
+              measured_twist.angular.z = measured.angular.z;
+              measured_motion = bringup::motion_safety_check_required(
+                measured_twist, 0.0, 0.0, 0.0, reverse_motion_threshold_);
+              measured_reverse = measured.linear.x < -reverse_motion_threshold_;
+            }
+          }
+          const bool command_motion = bringup::motion_safety_check_required(
+            command, 0.0, 0.0, 0.0, reverse_motion_threshold_);
+          if (command_motion || measured_motion) {
+            std::string reason;
+            bool reverse_motion = measured_reverse ||
+              command.linear.x < -reverse_motion_threshold_;
+            if (!motionCommandIsSafeLocked(
+                command, now_ros_ns, now, reverse_motion, reason))
+            {
+              state_->clear();
+              motion_safety_trip_latch_.trip(now);
+              motion_safety_reverse_blocked_ = reverse_motion;
               RCLCPP_WARN_THROTTLE(
                 get_logger(), *get_clock(), 2000,
-                "Reverse component blocked by local costmap safety gate: %s", reason.c_str());
+                "Motion command stopped by swept-footprint safety gate: %s", reason.c_str());
             }
           }
         }
         const bool reverse_safety_blocked =
-          reverse_safety_trip_latch_.update(now, reverse_motion_latch_.active());
-        publishReverseBlockedStatusLocked(reverse_safety_blocked, now);
+          motion_safety_trip_latch_.update(now, false);
+        if (!reverse_safety_blocked) {
+          motion_safety_reverse_blocked_ = false;
+        }
+        publishReverseBlockedStatusLocked(
+          reverse_safety_blocked && motion_safety_reverse_blocked_, now);
         if (reverse_safety_blocked) {
-          append_safety_reason("reverse_footprint_safety_gate");
+          append_safety_reason("swept_footprint_safety_gate");
         }
         publishSafetyStatusLocked(
           safety_reason.empty() ? "ready" : "stop: " + safety_reason, now);
@@ -1108,6 +1110,7 @@ private:
 
   int socket_fd_{-1};
   std::string interface_;
+  std::string chassis_model_;
   std::unique_ptr<bringup::CommandState> state_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr reverse_blocked_publisher_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr safety_status_publisher_;
@@ -1119,17 +1122,14 @@ private:
   bool require_navigation_ready_{false};
   bool require_reverse_costmap_{true};
   bool reverse_unknown_is_blocked_{false};
-  bringup::ReverseMotionLatch reverse_motion_latch_;
-  bringup::ReverseSafetyTripLatch reverse_safety_trip_latch_;
-  int reverse_command_consecutive_cycles_{0};
-  int reverse_backward_sample_count_{0};
+  bringup::ReverseSafetyTripLatch motion_safety_trip_latch_;
+  bool motion_safety_reverse_blocked_{false};
   bool reverse_blocked_status_{false};
   bool have_reverse_blocked_publish_{false};
   bool have_safety_status_publish_{false};
   std::string last_safety_status_;
   std::chrono::steady_clock::time_point last_safety_status_publish_{};
   std::chrono::steady_clock::time_point last_reverse_blocked_publish_{};
-  int64_t last_reverse_odometry_stamp_ns_{-1};
   double perception_timeout_{0.5};
   double relocalization_timeout_{1.0};
   double reverse_costmap_timeout_{0.75};

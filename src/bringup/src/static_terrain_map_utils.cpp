@@ -264,10 +264,21 @@ bool loadStaticTerrainMap(
     };
 
   if (path.empty()) return fail("terrain_map_file is empty");
-  if (!fastdem::io::loadNpz(path, map)) {
-    return fail("failed to load terrain map: " + path);
+  std::string load_error;
+  if (!fastdem::io::loadNpz(path, map, &load_error)) {
+    return fail("failed to load terrain map '" + path + "': " + load_error);
   }
   if (!map.isInitialized()) return fail("terrain map is not initialized: " + path);
+  const auto size = map.getSize();
+  const auto start_index = map.getStartIndex();
+  if (size.x() <= 0 || size.y() <= 0 || start_index.x() < 0 || start_index.y() < 0 ||
+    start_index.x() >= size.x() || start_index.y() >= size.y() ||
+    !std::isfinite(map.getResolution()) || map.getResolution() <= 0.0F ||
+    !std::isfinite(map.getPosition().x()) || !std::isfinite(map.getPosition().y()) ||
+    !std::isfinite(map.getLength().x()) || !std::isfinite(map.getLength().y()))
+  {
+    return fail("terrain map has invalid dimensions, geometry, or start index: " + path);
+  }
   if (map.getFrameId() != expected_frame) {
     return fail(
       "terrain map frame '" + map.getFrameId() + "' does not match expected frame '" +
@@ -278,6 +289,13 @@ bool loadStaticTerrainMap(
       "class", "clearance"})
   {
     if (!map.exists(layer)) return fail("terrain map is missing layer: " + std::string(layer));
+    const auto & matrix = map.get(layer);
+    if (matrix.rows() != size.x() || matrix.cols() != size.y() ||
+      static_cast<std::size_t>(matrix.size()) !=
+      static_cast<std::size_t>(size.x()) * static_cast<std::size_t>(size.y()))
+    {
+      return fail("terrain map layer has invalid dimensions: " + std::string(layer));
+    }
   }
   return true;
 }

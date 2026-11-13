@@ -251,6 +251,22 @@ inline geometry_msgs::msg::Twist limit_navigation_command(
   return output;
 }
 
+inline bool motion_safety_check_required(
+  const geometry_msgs::msg::Twist & command,
+  double measured_linear_x, double measured_linear_y, double measured_angular_z,
+  double threshold)
+{
+  if (!std::isfinite(measured_linear_x) || !std::isfinite(measured_linear_y) ||
+    !std::isfinite(measured_angular_z) || !std::isfinite(threshold) || threshold < 0.0)
+  {
+    return true;
+  }
+  return std::hypot(command.linear.x, command.linear.y) > threshold ||
+         std::abs(command.angular.z) > threshold ||
+         std::hypot(measured_linear_x, measured_linear_y) > threshold ||
+         std::abs(measured_angular_z) > threshold;
+}
+
 class CommandState
 {
 public:
@@ -260,6 +276,15 @@ public:
   bool update(const geometry_msgs::msg::Twist & twist, std::chrono::steady_clock::time_point now)
   {
     if (!finite_twist(twist)) {
+      clear();
+      safety_fault_latched_ = true;
+      return false;
+    }
+    // The current CAN definition only has verified forward and yaw axes.
+    // Never silently drop lateral or other unsupported Twist components.
+    if (std::abs(twist.linear.y) > 1e-6 || std::abs(twist.linear.z) > 1e-6 ||
+      std::abs(twist.angular.x) > 1e-6 || std::abs(twist.angular.y) > 1e-6)
+    {
       clear();
       safety_fault_latched_ = true;
       return false;

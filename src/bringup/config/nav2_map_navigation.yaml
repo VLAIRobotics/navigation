@@ -119,8 +119,10 @@ controller_server:
       feasibility_check_no_poses: 5
       max_vel_x: 0.30
       max_vel_x_backwards: 0.10
+      max_vel_y: 0.0
       max_vel_theta: 0.30
       acc_lim_x: 0.30
+      acc_lim_y: 0.0
       acc_lim_theta: 0.40
       # 窄道内优先保持前进方向；必要倒车降速并由底盘出口做局部碰撞检查。
       weight_kinematics_forward_drive: 30.0

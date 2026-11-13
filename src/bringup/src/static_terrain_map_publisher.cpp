@@ -8,8 +8,10 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <functional>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <optional>
@@ -28,6 +30,7 @@
 #include <pcl/io/pcd_io.h>
 #include <pcl/point_types.h>
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp/executors/multi_threaded_executor.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <std_msgs/msg/color_rgba.hpp>
@@ -109,7 +112,7 @@ bool quantizeGridCoordinate(double coordinate, double origin, double resolution,
   const double grid_coordinate = std::floor((coordinate - origin) / resolution);
   if (!std::isfinite(grid_coordinate) ||
     grid_coordinate < static_cast<double>(std::numeric_limits<std::int64_t>::min()) ||
-    grid_coordinate > static_cast<double>(std::numeric_limits<std::int64_t>::max()))
+    grid_coordinate >= static_cast<double>(std::numeric_limits<std::int64_t>::max()))
   {
     return false;
   }
@@ -186,15 +189,19 @@ public:
     {
       throw std::invalid_argument("global_inflation_alpha must be in [0, 1]");
     }
-    const auto display_pcd_file = declare_parameter<std::string>("display_pcd_file", "");
-    const auto display_topic = declare_parameter<std::string>("display_topic", "/terrain_map/static_cloud");
-    const auto ground_display_voxel_size = declare_parameter<double>(
+    display_pcd_file_ = declare_parameter<std::string>("display_pcd_file", "");
+    display_ground_cache_file_ = declare_parameter<std::string>(
+      "display_ground_cache_file", "");
+    display_structure_cache_file_ = declare_parameter<std::string>(
+      "display_structure_cache_file", "");
+    display_topic_ = declare_parameter<std::string>("display_topic", "/terrain_map/static_cloud");
+    ground_display_voxel_size_ = declare_parameter<double>(
       "ground_display_voxel_size", 0.12);
-    if (!std::isfinite(ground_display_voxel_size) || ground_display_voxel_size <= 0.0) {
+    if (!std::isfinite(ground_display_voxel_size_) || ground_display_voxel_size_ <= 0.0) {
       throw std::invalid_argument("ground_display_voxel_size must be positive and finite");
     }
-    const auto max_display_height = declare_parameter<double>("display_max_height_above_ground", 1.2);
-    if (!std::isfinite(max_display_height) || max_display_height <= 0.0) {
+    max_display_height_ = declare_parameter<double>("display_max_height_above_ground", 1.2);
+    if (!std::isfinite(max_display_height_) || max_display_height_ <= 0.0) {
       throw std::invalid_argument("display_max_height_above_ground must be positive and finite");
     }
     const auto local_cloud_topic = declare_parameter<std::string>(
@@ -215,7 +222,7 @@ public:
       "local_cloud_fallback_ground_height", 0.25);
     local_cloud_timeout_ = declare_parameter<double>("local_cloud_timeout", 1.0);
     const auto local_max_height = declare_parameter<double>(
-      "local_cloud_max_height_above_ground", max_display_height);
+      "local_cloud_max_height_above_ground", max_display_height_);
     if (!std::isfinite(local_cloud_radius_) || local_cloud_radius_ <= 0.0) {
       throw std::invalid_argument("local_cloud_radius must be positive and finite");
     }
@@ -266,9 +273,14 @@ public:
       local_ground_display_topic, rclcpp::QoS(1).reliable());
     local_structure_cloud_publisher_ = create_publisher<sensor_msgs::msg::PointCloud2>(
       local_structure_display_topic, rclcpp::QoS(1).reliable());
+    local_cloud_callback_group_ = create_callback_group(
+      rclcpp::CallbackGroupType::MutuallyExclusive);
+    rclcpp::SubscriptionOptions local_cloud_subscription_options;
+    local_cloud_subscription_options.callback_group = local_cloud_callback_group_;
     local_cloud_subscription_ = create_subscription<sensor_msgs::msg::PointCloud2>(
       local_cloud_topic, rclcpp::SensorDataQoS(),
-      std::bind(&StaticTerrainMapPublisher::localCloudCallback, this, std::placeholders::_1));
+      std::bind(&StaticTerrainMapPublisher::localCloudCallback, this, std::placeholders::_1),
+      local_cloud_subscription_options);
     clearance_cloud_subscription_ = create_subscription<sensor_msgs::msg::PointCloud2>(
       clearance_cloud_topic, rclcpp::SensorDataQoS(),
       std::bind(
@@ -318,53 +330,14 @@ public:
     const auto message = fastdem::ros2::toGridMap(map_, "display_elevation");
     publisher_->publish(message);
     last_terrain_map_publish_ = std::chrono::steady_clock::now();
-    if (!display_pcd_file.empty()) {
-      pcl::PointCloud<pcl::PointXYZ> cloud;
-      if (pcl::io::loadPCDFile<pcl::PointXYZ>(display_pcd_file, cloud) != 0) {
-        throw std::runtime_error("Cannot load display PCD: " + display_pcd_file);
-      }
+    if (!display_pcd_file_.empty() || !display_ground_cache_file_.empty() ||
+      !display_structure_cache_file_.empty())
+    {
       display_publisher_ = create_publisher<sensor_msgs::msg::PointCloud2>(
-        display_topic, rclcpp::QoS(1).reliable().transient_local());
+        display_topic_, rclcpp::QoS(1).reliable().transient_local());
       static_structure_publisher_ = create_publisher<visualization_msgs::msg::MarkerArray>(
         "/navigation_display/static_pcd_structures",
         rclcpp::QoS(8).reliable().transient_local());
-      std::vector<ColoredDisplayPoint> ground_points;
-      std::vector<ColoredDisplayPoint> structure_points;
-      ground_points.reserve(cloud.size() / 5);
-      structure_points.reserve(cloud.size());
-      std::unordered_set<std::uint64_t> ground_voxels;
-      ground_voxels.reserve(cloud.size() / 5);
-      std::size_t height_rejected = 0;
-      for (const auto & point : cloud.points) {
-        const auto height = bringup::staticDisplayHeightAboveGround(
-          map_, point.x, point.y, point.z, fallback_ground_);
-        if (!height || *height > max_display_height) {
-          ++height_rejected;
-          continue;
-        }
-        const ColoredDisplayPoint display_point{
-          point.x, point.y, point.z, *height};
-        if (std::abs(*height) <= 0.10F) {
-          if (ground_voxels.insert(groundVoxelKey(
-              point.x, point.y, ground_display_voxel_size)).second)
-          {
-            ground_points.push_back(display_point);
-          }
-        } else {
-          structure_points.push_back(display_point);
-        }
-      }
-      const auto stamp = get_clock()->now();
-      const auto structure_count = structure_points.size();
-      display_publisher_->publish(makeColoredCloud(
-        ground_points, frame_id_, stamp));
-      pending_structure_points_ = std::move(structure_points);
-      buildStaticStructureIndex();
-      RCLCPP_INFO(
-        get_logger(),
-        "Published derived PCD display '%s': input=%zu ground=%zu/%.2fm structure=%zu rejected=%zu max_height=%.2fm",
-        display_pcd_file.c_str(), cloud.size(), ground_points.size(), ground_display_voxel_size,
-        structure_count, height_rejected, max_display_height);
     }
     RCLCPP_INFO(
       get_logger(), "Published static terrain map '%s' on %s: %dx%d cells at %.3f m",
@@ -373,7 +346,8 @@ public:
 
     local_cloud_timeout_timer_ = create_wall_timer(
       std::chrono::milliseconds(100),
-      std::bind(&StaticTerrainMapPublisher::expireLocalCloud, this));
+      std::bind(&StaticTerrainMapPublisher::expireLocalCloud, this),
+      local_cloud_callback_group_);
 
     global_inflation_ = create_publisher<visualization_msgs::msg::MarkerArray>(
       "/navigation_display/global_inflation", rclcpp::QoS(1).reliable().transient_local());
@@ -434,9 +408,107 @@ public:
         "/fastdem/postprocess/gridmap", rclcpp::SensorDataQoS(),
         std::bind(&StaticTerrainMapPublisher::onlineTerrainCallback, this, std::placeholders::_1));
     }
+    if (display_publisher_) {
+      display_load_timer_ = create_wall_timer(
+        std::chrono::milliseconds(10), [this]() {
+          display_load_timer_->cancel();
+          RCLCPP_INFO(
+            get_logger(), "Loading static PCD display cache while local cloud callbacks remain active");
+          loadStaticPcdDisplay();
+        });
+    }
   }
 
 private:
+  void loadStaticPcdDisplay()
+  {
+    const bool have_classified_cache = !display_ground_cache_file_.empty() ||
+      !display_structure_cache_file_.empty();
+    if (have_classified_cache &&
+      (display_ground_cache_file_.empty() || display_structure_cache_file_.empty()))
+    {
+      throw std::runtime_error(
+              "display_ground_cache_file and display_structure_cache_file must be supplied together");
+    }
+
+    std::vector<ColoredDisplayPoint> ground_points;
+    std::vector<ColoredDisplayPoint> structure_points;
+    std::unordered_set<std::uint64_t> ground_voxels;
+    std::size_t height_rejected = 0;
+    std::size_t input_count = 0;
+    bool structure_index_loaded = false;
+    if (have_classified_cache) {
+      pcl::PointCloud<pcl::PointXYZI> cached_ground;
+      if (pcl::io::loadPCDFile<pcl::PointXYZI>(display_ground_cache_file_, cached_ground) != 0) {
+        throw std::runtime_error(
+                "Cannot load classified ground cache: " + display_ground_cache_file_);
+      }
+      height_rejected += loadStaticStructureIndex(
+        display_structure_cache_file_, static_cast<float>(max_display_height_));
+      structure_index_loaded = true;
+      input_count = cached_ground.size() + staticStructurePointCount() + height_rejected;
+      ground_points.reserve(cached_ground.size() / 2);
+      ground_voxels.reserve(cached_ground.size() / 2 + 1);
+      for (const auto & point : cached_ground.points) {
+        if (!std::isfinite(point.x) || !std::isfinite(point.y) ||
+          !std::isfinite(point.z) || !std::isfinite(point.intensity) ||
+          point.intensity > max_display_height_)
+        {
+          ++height_rejected;
+          continue;
+        }
+        if (ground_voxels.insert(groundVoxelKey(
+            point.x, point.y, ground_display_voxel_size_)).second)
+        {
+          ground_points.push_back({point.x, point.y, point.z, point.intensity});
+        }
+      }
+    } else if (!display_pcd_file_.empty()) {
+      pcl::PointCloud<pcl::PointXYZ> cloud;
+      if (pcl::io::loadPCDFile<pcl::PointXYZ>(display_pcd_file_, cloud) != 0) {
+        throw std::runtime_error("Cannot load display PCD: " + display_pcd_file_);
+      }
+      input_count = cloud.size();
+      ground_points.reserve(cloud.size() / 5);
+      structure_points.reserve(cloud.size());
+      ground_voxels.reserve(cloud.size() / 5);
+      for (const auto & point : cloud.points) {
+        const auto height = bringup::staticDisplayHeightAboveGround(
+          map_, point.x, point.y, point.z, fallback_ground_);
+        if (!height || *height > max_display_height_) {
+          ++height_rejected;
+          continue;
+        }
+        const ColoredDisplayPoint display_point{point.x, point.y, point.z, *height};
+        if (std::abs(*height) <= 0.10F) {
+          if (ground_voxels.insert(groundVoxelKey(
+              point.x, point.y, ground_display_voxel_size_)).second)
+          {
+            ground_points.push_back(display_point);
+          }
+        } else {
+          structure_points.push_back(display_point);
+        }
+      }
+    } else {
+      return;
+    }
+
+    const auto stamp = get_clock()->now();
+    const auto structure_count = structure_index_loaded
+      ? staticStructurePointCount() : structure_points.size();
+    display_publisher_->publish(makeColoredCloud(ground_points, frame_id_, stamp));
+    pending_structure_points_ = std::move(structure_points);
+    if (!structure_index_loaded) buildStaticStructureIndex();
+    RCLCPP_INFO(
+      get_logger(),
+      "Published derived PCD display '%s': input=%zu ground=%zu/%.2fm structure=%zu rejected=%zu max_height=%.2fm cache=%s",
+      have_classified_cache ? display_ground_cache_file_.c_str() : display_pcd_file_.c_str(),
+      input_count, ground_points.size(), ground_display_voxel_size_,
+      structure_count, height_rejected, max_display_height_,
+      have_classified_cache ? "preclassified+preindexed" : "generated_at_startup");
+  }
+
   void localCloudCallback(sensor_msgs::msg::PointCloud2::ConstSharedPtr message)
   {
     const bool has_local_display_subscriber = (local_ground_cloud_publisher_ &&
@@ -1319,6 +1391,115 @@ private:
       static_structure_tiles_.size());
   }
 
+  std::size_t staticStructurePointCount() const
+  {
+    std::size_t count = 0;
+    for (const auto & tile : static_structure_tiles_) count += tile.points.size();
+    return count;
+  }
+
+  std::size_t loadStaticStructureIndex(const std::string & path, float max_height_above_ground)
+  {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) throw std::runtime_error("Cannot open static structure index: " + path);
+    constexpr char expected_magic[8]{'L', '1', 'S', 'P', 'C', 'D', 'I', '1'};
+    char magic[sizeof(expected_magic)]{};
+    input.read(magic, sizeof(magic));
+    if (!input || std::memcmp(expected_magic, magic, sizeof(magic)) != 0) {
+      throw std::runtime_error("Invalid static structure index header: " + path);
+    }
+    double resolution = 0.0;
+    double origin_x = 0.0;
+    double origin_y = 0.0;
+    std::int64_t tile_cells = 0;
+    std::uint64_t point_count = 0;
+    std::uint64_t tile_count = 0;
+    input.read(reinterpret_cast<char *>(&resolution), sizeof(resolution));
+    input.read(reinterpret_cast<char *>(&origin_x), sizeof(origin_x));
+    input.read(reinterpret_cast<char *>(&origin_y), sizeof(origin_y));
+    input.read(reinterpret_cast<char *>(&tile_cells), sizeof(tile_cells));
+    input.read(reinterpret_cast<char *>(&point_count), sizeof(point_count));
+    input.read(reinterpret_cast<char *>(&tile_count), sizeof(tile_count));
+    constexpr std::uint64_t kMaxCachedStructurePoints = 20'000'000;
+    const auto expected_tile_cells = std::max<std::int64_t>(
+      1, static_cast<std::int64_t>(std::ceil(4.0 / static_pcd_map_resolution_)));
+    if (!input || !std::isfinite(resolution) || !std::isfinite(origin_x) ||
+      !std::isfinite(origin_y) || resolution <= 0.0 || tile_cells != expected_tile_cells ||
+      std::abs(resolution - static_pcd_map_resolution_) > 1e-9 ||
+      std::abs(origin_x - static_pcd_base_origin_x_) > 1e-6 ||
+      std::abs(origin_y - static_pcd_base_origin_y_) > 1e-6 ||
+      point_count > kMaxCachedStructurePoints || tile_count > point_count ||
+      (point_count == 0) != (tile_count == 0))
+    {
+      throw std::runtime_error("Static structure index geometry or counts do not match the terrain map");
+    }
+
+    structure_points_by_cell_.clear();
+    static_structure_tiles_.clear();
+    structure_points_by_cell_.reserve(static_cast<std::size_t>(point_count / 4 + 1));
+    std::int32_t last_record_tile_id = -1;
+    std::int32_t current_loaded_tile_id = -1;
+    std::uint64_t source_tile_count = 0;
+    std::size_t height_rejected = 0;
+    for (std::uint64_t index = 0; index < point_count; ++index) {
+      std::int32_t tile_id = -1;
+      GridCellKey cell{};
+      ColoredDisplayPoint point{};
+      std::array<float, 4> cached_point{};
+      input.read(reinterpret_cast<char *>(&tile_id), sizeof(tile_id));
+      input.read(reinterpret_cast<char *>(&cell.x), sizeof(cell.x));
+      input.read(reinterpret_cast<char *>(&cell.y), sizeof(cell.y));
+      input.read(reinterpret_cast<char *>(cached_point.data()), sizeof(cached_point));
+      point = {cached_point[0], cached_point[1], cached_point[2], cached_point[3]};
+      if (!input || tile_id < 0 || !std::isfinite(point.x) || !std::isfinite(point.y) ||
+        !std::isfinite(point.z) || !std::isfinite(point.height_above_ground))
+      {
+        throw std::runtime_error("Truncated or invalid static structure index record");
+      }
+      if (tile_id != last_record_tile_id) {
+        if (tile_id != last_record_tile_id + 1) {
+          throw std::runtime_error("Static structure index tile IDs are not contiguous");
+        }
+        last_record_tile_id = tile_id;
+        current_loaded_tile_id = -1;
+        ++source_tile_count;
+      }
+      GridCellKey expected_cell{};
+      if (!quantizeGridCoordinate(
+          point.x, static_pcd_base_origin_x_, static_pcd_map_resolution_, expected_cell.x) ||
+        !quantizeGridCoordinate(
+          point.y, static_pcd_base_origin_y_, static_pcd_map_resolution_, expected_cell.y) ||
+        !(expected_cell == cell))
+      {
+        throw std::runtime_error("Static structure index contains a point/cell mismatch");
+      }
+      if (point.height_above_ground > max_height_above_ground) {
+        ++height_rejected;
+        continue;
+      }
+      if (current_loaded_tile_id < 0) {
+        current_loaded_tile_id = static_cast<std::int32_t>(static_structure_tiles_.size());
+        static_structure_tiles_.push_back({current_loaded_tile_id, {}});
+      }
+      auto & tile = static_structure_tiles_.back();
+      const auto point_index = tile.points.size();
+      tile.points.push_back({point, cell, {}});
+      structure_points_by_cell_[cell].push_back({
+        static_cast<std::size_t>(current_loaded_tile_id), point_index});
+    }
+    if (!input || source_tile_count != tile_count) {
+      throw std::runtime_error("Static structure index has inconsistent tile records");
+    }
+    if (input.peek() != std::char_traits<char>::eof()) {
+      throw std::runtime_error("Static structure index contains trailing data");
+    }
+    static_structure_refresh_state_.markDirty();
+    RCLCPP_INFO(
+      get_logger(), "Loaded preindexed static PCD structures: %zu points, %zu tiles",
+      static_cast<std::size_t>(point_count), static_structure_tiles_.size());
+    return height_rejected;
+  }
+
   visualization_msgs::msg::Marker makeStaticStructureMarker(
     const StaticStructureTile & tile, const rclcpp::Time & stamp) const
   {
@@ -1888,6 +2069,12 @@ private:
   std::chrono::steady_clock::time_point last_effective_obstacles_publish_{};
   std::chrono::steady_clock::time_point last_global_inflation_publish_{};
   std::chrono::steady_clock::time_point last_local_inflation_publish_{};
+  std::string display_pcd_file_;
+  std::string display_ground_cache_file_;
+  std::string display_structure_cache_file_;
+  std::string display_topic_;
+  double ground_display_voxel_size_{0.12};
+  double max_display_height_{1.2};
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
   rclcpp::Publisher<grid_map_msgs::msg::GridMap>::SharedPtr publisher_;
@@ -1909,8 +2096,10 @@ private:
   rclcpp::Subscription<grid_map_msgs::msg::GridMap>::SharedPtr online_terrain_subscription_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr local_cloud_subscription_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr clearance_cloud_subscription_;
+  rclcpp::CallbackGroup::SharedPtr local_cloud_callback_group_;
   rclcpp::TimerBase::SharedPtr local_cloud_timeout_timer_;
   rclcpp::TimerBase::SharedPtr inflation_retry_timer_;
+  rclcpp::TimerBase::SharedPtr display_load_timer_;
   std::chrono::steady_clock::time_point last_local_cloud_received_{};
   bool have_local_cloud_{false};
   bool local_cloud_visible_{false};
@@ -1922,7 +2111,10 @@ int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
   try {
-    rclcpp::spin(std::make_shared<StaticTerrainMapPublisher>());
+    auto node = std::make_shared<StaticTerrainMapPublisher>();
+    rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 2);
+    executor.add_node(node);
+    executor.spin();
   } catch (const std::exception & error) {
     RCLCPP_FATAL(rclcpp::get_logger("static_terrain_map_publisher"), "%s", error.what());
     rclcpp::shutdown();

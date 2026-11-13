@@ -108,6 +108,39 @@ TEST(ChassisDriver, InvalidCommandImmediatelyStops)
   EXPECT_EQ(decode_le(state.frame(now), 2), 0);
 }
 
+TEST(ChassisDriver, UnsupportedLateralCommandLatchesStopInsteadOfBeingIgnored)
+{
+  bringup::ChassisConfig config;
+  bringup::CommandState state(config);
+  const auto now = std::chrono::steady_clock::now();
+  ASSERT_TRUE(state.update(twist(0.20, 0.0), now));
+  auto lateral = twist(0.0, 0.0);
+  lateral.linear.y = 0.10;
+
+  EXPECT_FALSE(state.update(lateral, now + std::chrono::milliseconds(10)));
+  EXPECT_EQ(decode_le(state.frame(now + std::chrono::milliseconds(10)), 2), 0);
+  EXPECT_TRUE(state.safety_fault_latched());
+}
+
+TEST(ChassisDriver, MotionSafetyGateCoversForwardLateralDiagonalAndRotation)
+{
+  auto forward = twist(0.1, 0.0);
+  EXPECT_TRUE(bringup::motion_safety_check_required(forward, 0.0, 0.0, 0.0, 0.05));
+
+  auto lateral = twist(0.0, 0.0);
+  lateral.linear.y = 0.1;
+  EXPECT_TRUE(bringup::motion_safety_check_required(lateral, 0.0, 0.0, 0.0, 0.05));
+
+  auto diagonal = twist(0.1, 0.0);
+  diagonal.linear.y = 0.1;
+  EXPECT_TRUE(bringup::motion_safety_check_required(diagonal, 0.0, 0.0, 0.0, 0.05));
+
+  auto rotate = twist(0.0, 0.1);
+  EXPECT_TRUE(bringup::motion_safety_check_required(rotate, 0.0, 0.0, 0.0, 0.05));
+  EXPECT_TRUE(bringup::motion_safety_check_required(
+    twist(0.0, 0.0), 0.0, 0.1, 0.0, 0.05));
+}
+
 TEST(ChassisDriver, SevereFiniteCommandLatchesStop)
 {
   bringup::ChassisConfig config;

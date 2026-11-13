@@ -404,13 +404,26 @@ public:
 private:
   void priorMapCallback(nav_msgs::msg::OccupancyGrid::ConstSharedPtr message)
   {
+    const auto cell_count = static_cast<std::uint64_t>(message->info.width) *
+      static_cast<std::uint64_t>(message->info.height);
+    const auto & orientation = message->info.origin.orientation;
+    const double quaternion_norm = orientation.x * orientation.x +
+      orientation.y * orientation.y + orientation.z * orientation.z +
+      orientation.w * orientation.w;
     if (message->header.frame_id != map_frame_ || message->info.width == 0 ||
       message->info.height == 0 || !std::isfinite(message->info.resolution) ||
       message->info.resolution <= 0.0F ||
       !std::isfinite(message->info.origin.position.x) ||
       !std::isfinite(message->info.origin.position.y) ||
       !std::isfinite(message->info.origin.position.z) ||
-      message->data.size() != static_cast<std::size_t>(message->info.width) * message->info.height)
+      !std::isfinite(orientation.x) || !std::isfinite(orientation.y) ||
+      !std::isfinite(orientation.z) || !std::isfinite(orientation.w) ||
+      !std::isfinite(quaternion_norm) || quaternion_norm < 1.0e-12 ||
+      message->info.width > static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
+      message->info.height > static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
+      cell_count > static_cast<std::uint64_t>(max_map_cells_) ||
+      cell_count > std::numeric_limits<std::size_t>::max() ||
+      message->data.size() != static_cast<std::size_t>(cell_count))
     {
       RCLCPP_ERROR_THROTTLE(
         get_logger(), *get_clock(), 5000,
@@ -426,118 +439,136 @@ private:
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (map_ready_) return;
-      if (ground_provenance_file_.empty() != occupancy_source_file_.empty()) {
-        throw std::runtime_error(
-          "saved ground and occupancy source rasters must be loaded as one snapshot");
-      }
-      map_ = *message;
-      map_geometry_version_ = 1;
-      latched_geometry_version = map_geometry_version_;
-      original_width_ = map_.info.width;
-      original_height_ = map_.info.height;
-      tf2::Transform map_from_grid;
-      tf2::fromMsg(map_.info.origin, map_from_grid);
-      grid_from_map_ = map_from_grid.inverse();
-      map_ready_ = true;
-      obstacle_evidence_.assign(map_.data.size(), bringup::ConsecutiveObservation{});
-      ray_clear_evidence_.assign(map_.data.size(), bringup::ConsecutiveObservation{});
-      latest_obstacle_hit_stamp_ns_.assign(map_.data.size(), 0);
-      ground_evidence_.assign(map_.data.size(), bringup::TimeWindowObservation{});
-      prior_occupied_.resize(map_.data.size());
-      online_occupied_.assign(map_.data.size(), 0);
-      ground_provenance_.assign(map_.data.size(), 0);
-      if (ground_provenance_file_.empty()) {
-        std::transform(
-          map_.data.begin(), map_.data.end(), prior_occupied_.begin(),
-          [](std::int8_t occupancy) { return static_cast<std::uint8_t>(occupancy >= 65); });
-      } else {
-        validateSourceRasterMetadata(ground_provenance_file_, map_);
-        validateSourceRasterMetadata(occupancy_source_file_, map_);
-        const auto ground_pixels = readSourcePgm(
-          ground_provenance_file_, map_.info.width, map_.info.height);
-        const auto occupancy_pixels = readSourcePgm(
-          occupancy_source_file_, map_.info.width, map_.info.height);
-        for (std::uint32_t image_row = 0; image_row < map_.info.height; ++image_row) {
-          const auto grid_y = map_.info.height - 1U - image_row;
-          for (std::uint32_t x = 0; x < map_.info.width; ++x) {
-            const auto image_index = static_cast<std::size_t>(image_row) * map_.info.width + x;
-            const auto grid_index = static_cast<std::size_t>(grid_y) * map_.info.width + x;
-            ground_provenance_[grid_index] = static_cast<std::int8_t>(
-              decodeGroundSourcePixel(ground_pixels[image_index]));
-            const auto source_mask = decodeOccupancySourcePixel(occupancy_pixels[image_index]);
-            const auto occupancy_sources = bringup::restoreOccupancySourceFlags(
-              source_mask, map_.data[grid_index]);
-            if (!occupancy_sources) {
-              throw std::runtime_error("saved occupancy source mask is outside its encoding");
-            }
-            prior_occupied_[grid_index] = static_cast<std::uint8_t>(occupancy_sources->prior);
-            online_occupied_[grid_index] = static_cast<std::uint8_t>(occupancy_sources->online);
-            if (online_occupied_[grid_index]) ++online_occupied_count_;
-          }
-        }
-      }
-      if (!terrain_map_file_.empty()) {
-        if (!fastdem::io::loadNpz(terrain_map_file_, static_terrain_map_) ||
-          !static_terrain_map_.isInitialized() ||
-          static_terrain_map_.getFrameId() != map_.header.frame_id)
-        {
+      try {
+        if (ground_provenance_file_.empty() != occupancy_source_file_.empty()) {
           throw std::runtime_error(
-            "Failed to load matching static terrain map for global ground provenance");
+            "saved ground and occupancy source rasters must be loaded as one snapshot");
         }
-        validateTerrainGeometry(map_, static_terrain_map_);
-        if (!static_terrain_map_.exists("class")) {
-          throw std::runtime_error("saved terrain map has no class layer");
+        map_ = *message;
+        map_geometry_version_ = 1;
+        latched_geometry_version = map_geometry_version_;
+        original_width_ = map_.info.width;
+        original_height_ = map_.info.height;
+        tf2::Transform map_from_grid;
+        tf2::fromMsg(map_.info.origin, map_from_grid);
+        grid_from_map_ = map_from_grid.inverse();
+        obstacle_evidence_.assign(map_.data.size(), bringup::ConsecutiveObservation{});
+        ray_clear_evidence_.assign(map_.data.size(), bringup::ConsecutiveObservation{});
+        latest_obstacle_hit_stamp_ns_.assign(map_.data.size(), 0);
+        ground_evidence_.assign(map_.data.size(), bringup::TimeWindowObservation{});
+        prior_occupied_.resize(map_.data.size());
+        online_occupied_.assign(map_.data.size(), 0);
+        ground_provenance_.assign(map_.data.size(), 0);
+        online_occupied_count_ = 0;
+        if (ground_provenance_file_.empty()) {
+          std::transform(
+            map_.data.begin(), map_.data.end(), prior_occupied_.begin(),
+            [](std::int8_t occupancy) { return static_cast<std::uint8_t>(occupancy >= 65); });
+        } else {
+          validateSourceRasterMetadata(ground_provenance_file_, map_);
+          validateSourceRasterMetadata(occupancy_source_file_, map_);
+          const auto ground_pixels = readSourcePgm(
+            ground_provenance_file_, map_.info.width, map_.info.height);
+          const auto occupancy_pixels = readSourcePgm(
+            occupancy_source_file_, map_.info.width, map_.info.height);
+          for (std::uint32_t image_row = 0; image_row < map_.info.height; ++image_row) {
+            const auto grid_y = map_.info.height - 1U - image_row;
+            for (std::uint32_t x = 0; x < map_.info.width; ++x) {
+              const auto image_index =
+                static_cast<std::size_t>(image_row) * map_.info.width + x;
+              const auto grid_index =
+                static_cast<std::size_t>(grid_y) * map_.info.width + x;
+              ground_provenance_[grid_index] = static_cast<std::int8_t>(
+                decodeGroundSourcePixel(ground_pixels[image_index]));
+              const auto source_mask =
+                decodeOccupancySourcePixel(occupancy_pixels[image_index]);
+              const auto occupancy_sources = bringup::restoreOccupancySourceFlags(
+                source_mask, map_.data[grid_index]);
+              if (!occupancy_sources) {
+                throw std::runtime_error(
+                  "saved occupancy source mask is outside its encoding");
+              }
+              prior_occupied_[grid_index] =
+                static_cast<std::uint8_t>(occupancy_sources->prior);
+              online_occupied_[grid_index] =
+                static_cast<std::uint8_t>(occupancy_sources->online);
+              if (online_occupied_[grid_index]) ++online_occupied_count_;
+            }
+          }
         }
-        const bool has_source = static_terrain_map_.exists("ground_source");
-        for (const auto cell : static_terrain_map_.cells()) {
-          const auto position = static_terrain_map_.position(cell);
-          if (!position) {
-            throw std::runtime_error("saved terrain map contains a cell without a position");
+        if (!terrain_map_file_.empty()) {
+          std::string terrain_error;
+          if (!fastdem::io::loadNpz(terrain_map_file_, static_terrain_map_, &terrain_error)) {
+            throw std::runtime_error(
+              "invalid static terrain NPZ '" + terrain_map_file_ + "': " + terrain_error);
           }
-          const auto map_index = mapCell(position->x(), position->y());
-          if (!map_index) {
-            throw std::runtime_error("saved terrain source cell lies outside the fused map");
-          }
-          const auto raw_class = static_terrain_map_.get("class")(cell.index);
-          if (!std::isfinite(raw_class) || raw_class < -0.5F || raw_class > 2.5F) {
-            throw std::runtime_error("saved terrain map contains an invalid class value");
-          }
-          const auto class_code = static_cast<std::int8_t>(std::lround(raw_class));
-          if (std::abs(raw_class - class_code) > 1.0e-4F) {
-            throw std::runtime_error("saved terrain map contains a fractional class value");
-          }
-          std::int8_t source = class_code == 1 ? 1 : 0;
-          if (has_source) {
-            const auto raw_source = static_terrain_map_.get("ground_source")(cell.index);
-            if (!std::isfinite(raw_source) || raw_source < -0.5F || raw_source > 1.5F) {
-              throw std::runtime_error("saved terrain map contains an invalid ground source");
-            }
-            source = static_cast<std::int8_t>(std::lround(raw_source));
-            if (std::abs(raw_source - source) > 1.0e-4F) {
-              throw std::runtime_error("saved terrain map contains a fractional ground source");
-            }
-          }
-          if (ground_provenance_file_.empty()) {
-            ground_provenance_[*map_index] = source;
-          }
-          if (!bringup::terrainGroundSourceMatches(
-              class_code, source, ground_provenance_[*map_index]))
+          if (!static_terrain_map_.isInitialized() ||
+            static_terrain_map_.getFrameId() != map_.header.frame_id)
           {
             throw std::runtime_error(
-              "saved terrain NPZ, class and ground-source raster are inconsistent");
+              "static terrain map is uninitialized or has a mismatched frame");
           }
-          if (source != 0 && map_.data[*map_index] < 0) {
-            // Ground proven by the terrain revision is traversable in the
-            // global occupancy map; the terrain costmap keeps its extra cost.
-            map_.data[*map_index] = 0;
+          validateTerrainGeometry(map_, static_terrain_map_);
+          if (!static_terrain_map_.exists("class")) {
+            throw std::runtime_error("saved terrain map has no class layer");
+          }
+          const bool has_source = static_terrain_map_.exists("ground_source");
+          for (const auto cell : static_terrain_map_.cells()) {
+            const auto position = static_terrain_map_.position(cell);
+            if (!position) {
+              throw std::runtime_error("saved terrain map contains a cell without a position");
+            }
+            const auto map_index = mapCell(position->x(), position->y());
+            if (!map_index) {
+              throw std::runtime_error("saved terrain source cell lies outside the fused map");
+            }
+            const auto raw_class = static_terrain_map_.get("class")(cell.index);
+            if (!std::isfinite(raw_class) || raw_class < -0.5F || raw_class > 2.5F) {
+              throw std::runtime_error("saved terrain map contains an invalid class value");
+            }
+            const auto class_code = static_cast<std::int8_t>(std::lround(raw_class));
+            if (std::abs(raw_class - class_code) > 1.0e-4F) {
+              throw std::runtime_error("saved terrain map contains a fractional class value");
+            }
+            std::int8_t source = class_code == 1 ? 1 : 0;
+            if (has_source) {
+              const auto raw_source = static_terrain_map_.get("ground_source")(cell.index);
+              if (!std::isfinite(raw_source) || raw_source < -0.5F || raw_source > 1.5F) {
+                throw std::runtime_error("saved terrain map contains an invalid ground source");
+              }
+              source = static_cast<std::int8_t>(std::lround(raw_source));
+              if (std::abs(raw_source - source) > 1.0e-4F) {
+                throw std::runtime_error("saved terrain map contains a fractional ground source");
+              }
+            }
+            if (ground_provenance_file_.empty()) {
+              ground_provenance_[*map_index] = source;
+            }
+            if (!bringup::terrainGroundSourceMatches(
+                class_code, source, ground_provenance_[*map_index]))
+            {
+              throw std::runtime_error(
+                "saved terrain NPZ, class and ground-source raster are inconsistent");
+            }
+            if (source != 0 && map_.data[*map_index] < 0) {
+              // Ground proven by the terrain revision is traversable in the
+              // global occupancy map; the terrain costmap keeps its extra cost.
+              map_.data[*map_index] = 0;
+            }
           }
         }
+        map_dirty_ = false;
+        map_ready_ = true;
+        map_.header.stamp = get_clock()->now();
+        latched_map = map_;
+        latched_provenance = makeGroundProvenanceSnapshotLocked();
+        latched_occupancy_source = makeOccupancySourceSnapshotLocked();
+      } catch (const std::exception & error) {
+        map_ready_ = false;
+        map_ = nav_msgs::msg::OccupancyGrid{};
+        RCLCPP_ERROR(get_logger(), "Rejecting prior map: %s", error.what());
+        return;
       }
-      map_dirty_ = false;
-      map_.header.stamp = get_clock()->now();
-      latched_map = map_;
-      latched_provenance = makeGroundProvenanceSnapshotLocked();
-      latched_occupancy_source = makeOccupancySourceSnapshotLocked();
     }
     publishFullMap(latched_map, latched_geometry_version);
     ground_provenance_pub_->publish(latched_provenance);

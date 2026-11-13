@@ -20,7 +20,7 @@
 按 `Ctrl+Alt+T` 打开终端，进入仓库根目录。路径不同的话，把示例路径改成你自己的路径：
 
 ~~~bash
-cd /home/nvidia/l1_navigation
+cd /home/nvidia/navigation
 ~~~
 
 复制下面整条命令运行：
@@ -39,9 +39,9 @@ cd /home/nvidia/l1_navigation
 ./tool/start_nav2.sh chassis_model:=omni config_file:=mid360.yaml sensor_height:=0.25 visualize:=true enable_chassis:=false
 ~~~
 
-脚本会从仓库内自动读取 `src/bringup/config/nav2_theta_teb_omni.yaml`。使用双轮时可省略 `chassis_model`，或写 `chassis_model:=two_wheel`。全向配置文件未放到指定位置时，脚本会提示缺少文件并停止启动。
+脚本加载基础参数文件 `src/bringup/config/nav2_theta_teb.yaml`，并由 launch 根据底盘 profile 覆盖 footprint、TEB 横移限制和平滑器 Y 轴限值。启动日志中的 `Chassis model=... footprint=... profile=...` 行显示实际模型。双轮 footprint 为 0.625 × 0.45 m；全向为 0.625 × 0.625 m，当前 `base_link` 纵向范围为 -0.350 到 0.275 m。使用 `chassis_model:=two_wheel` 切回双轮，省略参数也默认为双轮。
 
-全向参数文件和驱动也要适配实际底盘。当前 CAN 驱动尚未发送横移速度；只选全向 Nav2 参数不会让实车横移。首次切换仍保持 `enable_chassis:=false`，确认全向驱动和速度参数后再进行实车测试。
+全向模型会配置横移规划参数，但 CAN 协议中的横移字段、方向和倍率尚未确认；底盘驱动因此拒绝以 `chassis_model:=omni` 打开 CAN。保持 `enable_chassis:=false` 可检查规划参数，不能据此判断全向实车运动已可用。两种模型的实际 footprint 还要按车体尺寸和 `body↔base_link` 安装偏置核对。
 
 命令运行后不要关闭终端。RViz 应该打开，终端会继续显示节点运行信息。因为底盘关闭，机器人不会因这条命令移动；这个模式适合先检查界面和规划流程。
 
@@ -60,7 +60,7 @@ cd /home/nvidia/l1_navigation
 如果想确认导航程序是否在发布数据，按 `Ctrl+Alt+T` 再开一个终端，然后加载环境：
 
 ~~~bash
-cd /home/nvidia/l1_navigation
+cd /home/nvidia/navigation
 source /opt/ros/humble/setup.bash
 source install/setup.bash
 ros2 node list
@@ -90,7 +90,7 @@ ros2 topic hz /Odometry
   enable_chassis:=false
 ~~~
 
-双轮底盘省略 `chassis_model` 即可，也可显式设置 `chassis_model:=two_wheel`。已有 PCD 地图时，全向轮示例见[已有地图导航](使用手册.md#map-navigation)。
+双轮底盘省略 `chassis_model` 即可，也可显式设置 `chassis_model:=two_wheel`。已有 PCD 地图时，全向轮示例见[已有地图导航](Nav2导航与RViz操作.md#map-navigation)。
 
 ### 6. 真车运行
 
@@ -130,7 +130,7 @@ RViz 的 map 坐标系、Nav2 Goal 工具、代价显示和诊断面板见[RViz 
 先检查地图文件：
 
 ~~~bash
-cd /home/nvidia/l1_navigation
+cd /home/nvidia/navigation
 ls -lh PCD/clean_map.pcd
 ~~~
 
@@ -148,7 +148,7 @@ ls -lh PCD/clean_map.pcd
   enable_chassis:=false
 ~~~
 
-这里的 `PCD/clean_map.pcd` 是从仓库根目录开始的相对路径。如果你的仓库不在 `/home/nvidia/l1_navigation`，先按实际位置进入仓库目录再运行。
+这里的 `PCD/clean_map.pcd` 是从仓库根目录开始的相对路径。如果你的仓库不在 `/home/nvidia/navigation`，先按实际位置进入仓库目录再运行。
 
 默认使用双轮配置。全向轮配置只需在启动参数中加入 `chassis_model:=omni`：
 
@@ -161,21 +161,29 @@ ls -lh PCD/clean_map.pcd
   enable_chassis:=false
 ~~~
 
-脚本会自动读取仓库中的 `src/bringup/config/nav2_map_navigation_omni.yaml`；省略 `chassis_model` 时继续使用双轮默认配置。目标电脑上的仓库也必须包含对应的全向参数文件。
+脚本加载基础参数 `src/bringup/config/nav2_map_navigation.yaml`，再按 `chassis_model` 覆盖底盘 footprint 和运动限制。省略参数或传 `chassis_model:=two_wheel` 会使用 0.625 × 0.45 m 双轮模型；`omni` 使用 0.625 × 0.625 m footprint（`base_link` 下 x 为 -0.350 到 0.275 m，y 为 ±0.3125 m）。启动日志会打印模型、尺寸和 `chassis_models.yaml` profile 路径。请按实际安装偏置核对该 footprint。
+
+当前 CAN 驱动尚未确认全向横移协议字段，因此 `chassis_model:=omni enable_chassis:=true` 会被驱动拒绝；完成协议、方向和倍率标定前只用 `enable_chassis:=false`。默认只开导航 RViz，定位候选可在同一个窗口查看 `/small_gicp/candidate_pose`。
 
 ### 3. 等待地图转换和自动定位
 
 第一次使用某张地图时，程序会在 `PCD/clean_map_nav/` 下生成导航所需的二维地图、地形数据和定位点云。首次转换需要等待一会；以后地图和参数都没变时会复用这些文件。转换期间查看终端进度，不要重复启动第二份。
 
-接着会打开定位画面并自动搜索机器人在 PCD 中的位置。默认不需要你手工设置初始位姿。定位期间终端可能会显示搜索、匹配或质量检查信息；还没通过前不要发目标。确认成功时，日志会出现类似下面的英文原文：
+接着会自动搜索机器人在 PCD 中的位置。默认只打开一个导航 RViz；定位预览可在 Displays 中启用 `/small_gicp/candidate_pose`（橙色为未验证候选，正式定位在 `/small_gicp/pose`）。默认不需要手工设置初始位姿。定位期间终端会显示搜索、匹配或质量检查信息；还没通过前不要发目标。确认成功时，日志会出现类似下面的英文原文：
 
 ~~~text
-[*] Fresh localization handoff received; closing GICP RViz and enabling navigation RViz
+[*] Fresh localization handoff received; closing GICP RViz
 [*] Localization handoff is ready; NavigationGate may now activate Nav2
 [*] Map navigation is starting; lifecycle logs will report Nav2 activation and readiness
 ~~~
 
-意思是定位结果已交给导航，程序正在打开导航阶段。定位画面会关闭或切换，导航 RViz 接着显示。若只看到 `Starting map navigation gate...` 而始终没有上面这些成功信息，说明定位还没完成，不要发送目标。
+意思是定位结果已交给导航，程序正在启动导航阶段。默认只有导航 RViz；若显式打开了独立 GICP 窗口，首次 handoff 后它会关闭。若只看到 `Starting map navigation gate...` 而始终没有上面这些成功信息，说明定位还没完成，不要发送目标。
+
+手动初值使用 RViz 的 “2D Pose Estimate”，箭头表示 `base_link` 在 `map` 下的位置。带时间戳时按该时刻查 `odom→base_link`；零时间戳按最新 TF 处理并记录提示。已有可信三维定位时只更新平面位置和朝向，保留可信高度与倾斜；冷启动会等候带时间戳的 BBS 高度先验，不会默认把高度设为零。手动候选在通过 GICP 前不会接管定位。错误初值会在期限到达后解除自动搜索屏蔽；也可以在终端主动取消：
+
+~~~bash
+ros2 service call /small_gicp/cancel_manual_seed std_srvs/srv/Trigger "{}"
+~~~
 
 在定位确认之前：
 

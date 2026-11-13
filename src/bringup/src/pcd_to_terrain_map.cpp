@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <utility>
 
 #include <Eigen/Eigenvalues>
 #include <fastdem/elevation_map.hpp>
@@ -48,6 +49,8 @@ struct Options
   double occupied_radius{0.0};
   std::filesystem::path display_pcd_file;
   double display_voxel_size{0.10};
+  std::filesystem::path display_ground_cache_file;
+  std::filesystem::path display_structure_cache_file;
   std::filesystem::path relocalization_pcd_file;
   double relocalization_voxel_size{0.20};
   std::uint32_t min_obstacle_points{20};
@@ -267,6 +270,249 @@ void writeDisplayPcd(
     output.write(reinterpret_cast<const char *>(item.second.data()), 3 * sizeof(float));
   }
   if (!output) throw std::runtime_error("Failed writing display PCD: " + path.string());
+}
+
+void writeClassifiedDisplayPcd(
+  const std::filesystem::path & path,
+  const std::vector<std::array<float, 4>> & points)
+{
+  if (path.empty()) return;
+  if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
+  std::ofstream output(path, std::ios::binary);
+  if (!output) throw std::runtime_error("Cannot write display cache PCD: " + path.string());
+  output << "# .PCD v0.7 - Point Cloud Data file format\n"
+         << "VERSION 0.7\nFIELDS x y z intensity\nSIZE 4 4 4 4\nTYPE F F F F\nCOUNT 1 1 1 1\n"
+         << "WIDTH " << points.size() << "\nHEIGHT 1\nVIEWPOINT 0 0 0 1 0 0 0\n"
+         << "POINTS " << points.size() << "\nDATA binary\n";
+  for (const auto & point : points) {
+    output.write(reinterpret_cast<const char *>(point.data()), 4 * sizeof(float));
+  }
+  if (!output) throw std::runtime_error("Failed writing display cache PCD: " + path.string());
+}
+
+std::optional<float> displayHeightAboveGround(
+  const fastdem::ElevationMap & map, float x, float y, float z, float fallback_ground)
+{
+  const auto index = map.index(nanogrid::Position(x, y));
+  if (!index) return std::nullopt;
+  float ground = map.elevationAt(*index);
+  if (!std::isfinite(ground)) {
+    float nearest_distance_squared = std::numeric_limits<float>::infinity();
+    const auto size = map.getSize();
+    for (int dx = -3; dx <= 3; ++dx) {
+      for (int dy = -3; dy <= 3; ++dy) {
+        const int row = index->x() + dx;
+        const int col = index->y() + dy;
+        if (row < 0 || col < 0 || row >= size.x() || col >= size.y()) continue;
+        const float candidate = map.elevationAt(nanogrid::Index(row, col));
+        const float distance_squared = static_cast<float>(dx * dx + dy * dy);
+        if (std::isfinite(candidate) && distance_squared < nearest_distance_squared) {
+          ground = candidate;
+          nearest_distance_squared = distance_squared;
+        }
+      }
+    }
+  }
+  if (!std::isfinite(ground)) ground = fallback_ground;
+  if (!std::isfinite(ground)) return std::nullopt;
+  return z - ground;
+}
+
+struct CachedStructurePoint
+{
+  std::array<float, 4> point;
+  std::int64_t cell_x;
+  std::int64_t cell_y;
+  std::int64_t tile_x;
+  std::int64_t tile_y;
+};
+
+std::int64_t floorDivide(std::int64_t value, std::int64_t divisor)
+{
+  const auto quotient = value / divisor;
+  const auto remainder = value % divisor;
+  return remainder < 0 ? quotient - 1 : quotient;
+}
+
+bool gridCell(double coordinate, double origin, double resolution, std::int64_t & cell)
+{
+  const double value = std::floor((coordinate - origin) / resolution);
+  if (!std::isfinite(value) ||
+    value < static_cast<double>(std::numeric_limits<std::int64_t>::min()) ||
+    value >= static_cast<double>(std::numeric_limits<std::int64_t>::max()))
+  {
+    return false;
+  }
+  cell = static_cast<std::int64_t>(value);
+  return true;
+}
+
+void writeStaticStructureIndex(
+  const std::filesystem::path & path, const fastdem::ElevationMap & map,
+  std::vector<CachedStructurePoint> points)
+{
+  if (path.empty()) return;
+  if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
+  const double resolution = map.getResolution();
+  const double origin_x = map.getPosition().x() - map.getLength().x() / 2.0;
+  const double origin_y = map.getPosition().y() - map.getLength().y() / 2.0;
+  if (!std::isfinite(resolution) || resolution <= 0.0 || !std::isfinite(origin_x) ||
+    !std::isfinite(origin_y))
+  {
+    throw std::runtime_error("cannot index static structures against invalid terrain geometry");
+  }
+  const auto tile_cells = std::max<std::int64_t>(
+    1, static_cast<std::int64_t>(std::ceil(4.0 / resolution)));
+  std::sort(points.begin(), points.end(), [](const auto & lhs, const auto & rhs) {
+    if (lhs.tile_x != rhs.tile_x) return lhs.tile_x < rhs.tile_x;
+    if (lhs.tile_y != rhs.tile_y) return lhs.tile_y < rhs.tile_y;
+    if (lhs.cell_x != rhs.cell_x) return lhs.cell_x < rhs.cell_x;
+    if (lhs.cell_y != rhs.cell_y) return lhs.cell_y < rhs.cell_y;
+    if (lhs.point[0] != rhs.point[0]) return lhs.point[0] < rhs.point[0];
+    if (lhs.point[1] != rhs.point[1]) return lhs.point[1] < rhs.point[1];
+    return lhs.point[2] < rhs.point[2];
+  });
+
+  std::ofstream output(path, std::ios::binary);
+  if (!output) throw std::runtime_error("Cannot write static structure index: " + path.string());
+  constexpr char magic[8]{'L', '1', 'S', 'P', 'C', 'D', 'I', '1'};
+  output.write(magic, sizeof(magic));
+  const std::uint64_t point_count = points.size();
+  std::uint64_t tile_count = 0;
+  std::int64_t previous_tile_x = 0;
+  std::int64_t previous_tile_y = 0;
+  bool have_previous_tile = false;
+  for (const auto & point : points) {
+    if (!have_previous_tile || point.tile_x != previous_tile_x || point.tile_y != previous_tile_y) {
+      ++tile_count;
+      previous_tile_x = point.tile_x;
+      previous_tile_y = point.tile_y;
+      have_previous_tile = true;
+    }
+  }
+  if (tile_count > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max()) ||
+    point_count > 20'000'000)
+  {
+    throw std::runtime_error("static structure display cache exceeds its supported index capacity");
+  }
+  output.write(reinterpret_cast<const char *>(&resolution), sizeof(resolution));
+  output.write(reinterpret_cast<const char *>(&origin_x), sizeof(origin_x));
+  output.write(reinterpret_cast<const char *>(&origin_y), sizeof(origin_y));
+  output.write(reinterpret_cast<const char *>(&tile_cells), sizeof(tile_cells));
+  output.write(reinterpret_cast<const char *>(&point_count), sizeof(point_count));
+  output.write(reinterpret_cast<const char *>(&tile_count), sizeof(tile_count));
+  std::int32_t tile_id = -1;
+  previous_tile_x = 0;
+  previous_tile_y = 0;
+  have_previous_tile = false;
+  for (const auto & point : points) {
+    if (!have_previous_tile || point.tile_x != previous_tile_x || point.tile_y != previous_tile_y) {
+      ++tile_id;
+      previous_tile_x = point.tile_x;
+      previous_tile_y = point.tile_y;
+      have_previous_tile = true;
+    }
+    output.write(reinterpret_cast<const char *>(&tile_id), sizeof(tile_id));
+    output.write(reinterpret_cast<const char *>(&point.cell_x), sizeof(point.cell_x));
+    output.write(reinterpret_cast<const char *>(&point.cell_y), sizeof(point.cell_y));
+    output.write(reinterpret_cast<const char *>(point.point.data()), 4 * sizeof(float));
+  }
+  if (!output) throw std::runtime_error("Failed writing static structure index: " + path.string());
+}
+
+void writeStaticDisplayCaches(
+  const Options & options, const fastdem::ElevationMap & source_map,
+  const std::unordered_map<DisplayVoxelKey, std::array<float, 3>, DisplayVoxelHash> & voxels)
+{
+  if (options.display_ground_cache_file.empty() &&
+    options.display_structure_cache_file.empty()) return;
+
+  fastdem::ElevationMap display_map = source_map;
+  const auto original = display_map.get(fastdem::layer::elevation).eval();
+  auto & elevation = display_map.get(fastdem::layer::elevation);
+  const auto & classes = display_map.get("class");
+  for (Eigen::Index row = 0; row < original.rows(); ++row) {
+    for (Eigen::Index col = 0; col < original.cols(); ++col) {
+      const float current = original(row, col);
+      if (!std::isfinite(current) || classes(row, col) != 1.0F) continue;
+      std::vector<float> neighbors;
+      int nearby_support = 0;
+      for (Eigen::Index dr = -1; dr <= 1; ++dr) {
+        for (Eigen::Index dc = -1; dc <= 1; ++dc) {
+          if (dr == 0 && dc == 0) continue;
+          const auto nr = row + dr;
+          const auto nc = col + dc;
+          if (nr < 0 || nc < 0 || nr >= original.rows() || nc >= original.cols()) continue;
+          const float neighbor = original(nr, nc);
+          if (!std::isfinite(neighbor)) continue;
+          neighbors.push_back(neighbor);
+          if (std::abs(neighbor - current) <= 0.08F) ++nearby_support;
+        }
+      }
+      if (neighbors.size() < 3 || nearby_support >= 2) continue;
+      const auto middle = neighbors.begin() + neighbors.size() / 2;
+      std::nth_element(neighbors.begin(), middle, neighbors.end());
+      if (current > *middle + 0.18F) elevation(row, col) = *middle;
+    }
+  }
+
+  std::vector<float> ground_samples;
+  const auto & source_elevation = source_map.get(fastdem::layer::elevation);
+  const auto & source_classes = source_map.get("class");
+  for (Eigen::Index row = 0; row < source_elevation.rows(); ++row) {
+    for (Eigen::Index col = 0; col < source_elevation.cols(); ++col) {
+      if (source_classes(row, col) == 1.0F && std::isfinite(source_elevation(row, col))) {
+        ground_samples.push_back(source_elevation(row, col));
+      }
+    }
+  }
+  float fallback_ground = std::numeric_limits<float>::quiet_NaN();
+  if (!ground_samples.empty()) {
+    const auto middle = ground_samples.begin() + ground_samples.size() / 2;
+    std::nth_element(ground_samples.begin(), middle, ground_samples.end());
+    fallback_ground = *middle;
+  }
+
+  std::vector<std::array<float, 3>> ordered;
+  ordered.reserve(voxels.size());
+  for (const auto & item : voxels) ordered.push_back(item.second);
+  std::sort(ordered.begin(), ordered.end(), [](const auto & lhs, const auto & rhs) {
+    if (lhs[0] != rhs[0]) return lhs[0] < rhs[0];
+    if (lhs[1] != rhs[1]) return lhs[1] < rhs[1];
+    return lhs[2] < rhs[2];
+  });
+
+  std::vector<std::array<float, 4>> ground_points;
+  std::vector<CachedStructurePoint> structure_points;
+  ground_points.reserve(ordered.size() / 2);
+  structure_points.reserve(ordered.size());
+  const double map_resolution = display_map.getResolution();
+  const double map_origin_x = display_map.getPosition().x() - display_map.getLength().x() / 2.0;
+  const double map_origin_y = display_map.getPosition().y() - display_map.getLength().y() / 2.0;
+  const auto tile_cells = std::max<std::int64_t>(
+    1, static_cast<std::int64_t>(std::ceil(4.0 / map_resolution)));
+  for (const auto & point : ordered) {
+    const auto height = displayHeightAboveGround(
+      display_map, point[0], point[1], point[2], fallback_ground);
+    if (!height) continue;
+    const std::array<float, 4> classified{point[0], point[1], point[2], *height};
+    if (std::abs(*height) <= 0.10F) {
+      ground_points.push_back(classified);
+    } else {
+      CachedStructurePoint cached{};
+      cached.point = classified;
+      if (!gridCell(point[0], map_origin_x, map_resolution, cached.cell_x) ||
+        !gridCell(point[1], map_origin_y, map_resolution, cached.cell_y))
+      {
+        continue;
+      }
+      cached.tile_x = floorDivide(cached.cell_x, tile_cells);
+      cached.tile_y = floorDivide(cached.cell_y, tile_cells);
+      structure_points.push_back(cached);
+    }
+  }
+  writeClassifiedDisplayPcd(options.display_ground_cache_file, ground_points);
+  writeStaticStructureIndex(options.display_structure_cache_file, display_map, std::move(structure_points));
 }
 
 void writeRelocalizationPcd(
@@ -560,6 +806,7 @@ Options parseOptions(int argc, char ** argv)
       "[--max-ground-normal-angle=35] [--min-plane-points=6] "
       "[--min-valid-neighbors=16] "
       "[--occupied-radius=0.0] [--display-pcd=] [--display-voxel-size=0.10] "
+      "[--display-ground-cache=] [--display-structure-cache=] "
       "[--relocalization-pcd=] [--relocalization-voxel-size=0.20] "
       "[--min-obstacle-points=20] [--min-obstacle-fraction=0.05] "
       "[--max-cells=25000000] [--frame=map]");
@@ -585,6 +832,8 @@ Options parseOptions(int argc, char ** argv)
     else if (argument.rfind("--occupied-radius=", 0) == 0) options.occupied_radius = optionValue(argument, "occupied-radius");
     else if (argument.rfind("--display-pcd=", 0) == 0) options.display_pcd_file = stringOption(argument, "display-pcd");
     else if (argument.rfind("--display-voxel-size=", 0) == 0) options.display_voxel_size = optionValue(argument, "display-voxel-size");
+    else if (argument.rfind("--display-ground-cache=", 0) == 0) options.display_ground_cache_file = stringOption(argument, "display-ground-cache");
+    else if (argument.rfind("--display-structure-cache=", 0) == 0) options.display_structure_cache_file = stringOption(argument, "display-structure-cache");
     else if (argument.rfind("--relocalization-pcd=", 0) == 0) options.relocalization_pcd_file = stringOption(argument, "relocalization-pcd");
     else if (argument.rfind("--relocalization-voxel-size=", 0) == 0) options.relocalization_voxel_size = optionValue(argument, "relocalization-voxel-size");
     else if (argument.rfind("--min-obstacle-points=", 0) == 0) options.min_obstacle_points = static_cast<std::uint32_t>(std::stoul(stringOption(argument, "min-obstacle-points")));
@@ -952,6 +1201,7 @@ int main(int argc, char ** argv)
     fastdem::applyFeatureExtraction(
       map, static_cast<float>(options.analysis_radius), options.min_valid_neighbors,
       0.10f, 0.90f, options.min_observations, 0, "class");
+    writeStaticDisplayCaches(options, map, display_voxels);
     if (!fastdem::io::saveNpz(options.terrain_map_file.string(), map)) {
       throw std::runtime_error("Failed to write terrain map: " + options.terrain_map_file.string());
     }

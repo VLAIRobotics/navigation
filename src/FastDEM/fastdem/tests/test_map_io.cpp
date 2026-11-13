@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include <fstream>
+#include <iterator>
 #include <string>
 
 #include "fastdem/elevation_map.hpp"
@@ -12,6 +13,116 @@
 #include "fastdem/io/png.hpp"
 
 using namespace fastdem;
+
+namespace {
+
+bool replaceNpyHeaderText(std::string& archive, const std::string& entry_name,
+                          const std::string& from, const std::string& to) {
+  if (from.size() != to.size()) return false;
+  const auto entry = archive.find(entry_name);
+  if (entry == std::string::npos) return false;
+  const auto npy = entry + entry_name.size();
+  if (npy + 10 > archive.size()) return false;
+  const auto header_len = static_cast<std::size_t>(
+      static_cast<unsigned char>(archive[npy + 8])) |
+    (static_cast<std::size_t>(static_cast<unsigned char>(archive[npy + 9])) << 8);
+  const auto header = npy + 10;
+  if (header > archive.size() || header_len > archive.size() - header) return false;
+  const auto field = archive.find(from, header);
+  if (field == std::string::npos || field + from.size() > header + header_len) return false;
+  archive.replace(field, from.size(), to);
+  return true;
+}
+
+bool replaceMetaText(std::string& archive, const std::string& from,
+                     const std::string& to) {
+  if (from.size() != to.size()) return false;
+  const auto entry = archive.find("meta.npy");
+  if (entry == std::string::npos) return false;
+  const auto npy = entry + std::string("meta.npy").size();
+  if (npy + 10 > archive.size()) return false;
+  const auto header_len = static_cast<std::size_t>(
+      static_cast<unsigned char>(archive[npy + 8])) |
+    (static_cast<std::size_t>(static_cast<unsigned char>(archive[npy + 9])) << 8);
+  const auto data = npy + 10 + header_len;
+  if (data > archive.size()) return false;
+  const auto field = archive.find(from, data);
+  if (field == std::string::npos) return false;
+  archive.replace(field, from.size(), to);
+  return true;
+}
+
+bool replaceMetaTextKeepingSize(std::string& archive, const std::string& from,
+                                const std::string& to) {
+  const auto entry = archive.find("meta.npy");
+  if (entry == std::string::npos) return false;
+  const auto npy = entry + std::string("meta.npy").size();
+  if (npy + 10 > archive.size()) return false;
+  const auto header_len = static_cast<std::size_t>(
+      static_cast<unsigned char>(archive[npy + 8])) |
+    (static_cast<std::size_t>(static_cast<unsigned char>(archive[npy + 9])) << 8);
+  const auto data = npy + 10 + header_len;
+  if (data > archive.size()) return false;
+  const auto json_end = archive.find('}', data);
+  const auto field = archive.find(from, data);
+  if (json_end == std::string::npos || field == std::string::npos || field > json_end ||
+    from.size() > json_end + 1 - field)
+  {
+    return false;
+  }
+  const auto original_size = to.size() < from.size() ? from.size() - to.size() : 0;
+  const auto added_size = to.size() > from.size() ? to.size() - from.size() : 0;
+  archive.replace(field, from.size(), to);
+  if (added_size > 0) {
+    std::size_t remaining = added_size;
+    std::size_t cursor = field + to.size();
+    bool inside_string = false;
+    bool escaped = false;
+    auto adjusted_json_end = archive.find('}', data);
+    while (cursor < adjusted_json_end && remaining > 0) {
+      const char character = archive[cursor];
+      if (inside_string) {
+        if (escaped) {
+          escaped = false;
+        } else if (character == '\\') {
+          escaped = true;
+        } else if (character == '"') {
+          inside_string = false;
+        }
+        ++cursor;
+      } else if (character == '"') {
+        inside_string = true;
+        ++cursor;
+      } else if (character == ' ') {
+        archive.erase(cursor, 1);
+        --adjusted_json_end;
+        --remaining;
+      } else {
+        ++cursor;
+      }
+    }
+    return remaining == 0;
+  }
+  if (original_size > 0) {
+    archive.insert(field + to.size(), original_size, ' ');
+  }
+  return true;
+}
+
+bool readArchive(std::string& archive, const std::string& path) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) return false;
+  archive.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+  return true;
+}
+
+bool writeArchive(const std::string& archive, const std::string& path) {
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  output.write(archive.data(), static_cast<std::streamsize>(archive.size()));
+  return output.good();
+}
+
+}  // namespace
 
 // ─── NPZ tests ──────────────────────────────────────────────────────────────
 
@@ -167,6 +278,89 @@ TEST_F(NpzTest, FutureVersionRejected) {
 
   ElevationMap loaded;
   EXPECT_FALSE(io::loadNpz(tmp_path, loaded));
+}
+
+TEST_F(NpzTest, RejectsVersionOutsideIntegerRangeBeforeConversion) {
+  ASSERT_TRUE(io::saveNpz(tmp_path, map));
+  std::string archive;
+  ASSERT_TRUE(readArchive(archive, tmp_path));
+  ASSERT_TRUE(replaceMetaTextKeepingSize(
+      archive, "\"version\": 1", "\"version\":2147483648"));
+  ASSERT_TRUE(writeArchive(archive, tmp_path));
+
+  ElevationMap loaded;
+  std::string error;
+  EXPECT_FALSE(io::loadNpz(tmp_path, loaded, &error));
+  EXPECT_NE(error.find("version"), std::string::npos);
+}
+
+TEST_F(NpzTest, RejectsVersionOutsideFloatRangeInsteadOfTreatingItAsAbsent) {
+  ASSERT_TRUE(io::saveNpz(tmp_path, map));
+  std::string archive;
+  ASSERT_TRUE(readArchive(archive, tmp_path));
+  ASSERT_TRUE(replaceMetaTextKeepingSize(
+      archive, "\"version\": 1", "\"version\":1e100"));
+  ASSERT_TRUE(writeArchive(archive, tmp_path));
+
+  ElevationMap loaded;
+  std::string error;
+  EXPECT_FALSE(io::loadNpz(tmp_path, loaded, &error));
+  EXPECT_NE(error.find("version"), std::string::npos);
+}
+
+TEST_F(NpzTest, RejectsFractionalVersion) {
+  ASSERT_TRUE(io::saveNpz(tmp_path, map));
+  std::string archive;
+  ASSERT_TRUE(readArchive(archive, tmp_path));
+  ASSERT_TRUE(replaceMetaTextKeepingSize(
+      archive, "\"version\": 1", "\"version\":0.5"));
+  ASSERT_TRUE(writeArchive(archive, tmp_path));
+
+  ElevationMap loaded;
+  std::string error;
+  EXPECT_FALSE(io::loadNpz(tmp_path, loaded, &error));
+  EXPECT_NE(error.find("version"), std::string::npos);
+}
+
+TEST_F(NpzTest, RejectsLayerShapeThatDiffersFromMetadata) {
+  ASSERT_TRUE(io::saveNpz(tmp_path, map));
+  std::string archive;
+  ASSERT_TRUE(readArchive(archive, tmp_path));
+  ASSERT_TRUE(replaceNpyHeaderText(archive, "elevation.npy", "(20, 16)", "(19, 17)"));
+  ASSERT_TRUE(writeArchive(archive, tmp_path));
+
+  ElevationMap loaded;
+  std::string error;
+  EXPECT_FALSE(io::loadNpz(tmp_path, loaded, &error));
+  EXPECT_NE(error.find("unexpected shape"), std::string::npos);
+}
+
+TEST_F(NpzTest, RejectsLayerWithUnsupportedElementType) {
+  ASSERT_TRUE(io::saveNpz(tmp_path, map));
+  std::string archive;
+  ASSERT_TRUE(readArchive(archive, tmp_path));
+  ASSERT_TRUE(replaceNpyHeaderText(archive, "elevation.npy", "'<f4'", "'<i4'"));
+  ASSERT_TRUE(writeArchive(archive, tmp_path));
+
+  ElevationMap loaded;
+  std::string error;
+  EXPECT_FALSE(io::loadNpz(tmp_path, loaded, &error));
+  EXPECT_NE(error.find("float32"), std::string::npos);
+}
+
+TEST_F(NpzTest, RejectsStartIndexOutsideMapBounds) {
+  ElevationMap small_map(4.0f, 4.0f, 0.5f, "map");
+  ASSERT_TRUE(io::saveNpz(tmp_path, small_map));
+  std::string archive;
+  ASSERT_TRUE(readArchive(archive, tmp_path));
+  ASSERT_TRUE(replaceMetaText(
+      archive, "\"start_index\": [0, 0]", "\"start_index\": [9, 0]"));
+  ASSERT_TRUE(writeArchive(archive, tmp_path));
+
+  ElevationMap loaded;
+  std::string error;
+  EXPECT_FALSE(io::loadNpz(tmp_path, loaded, &error));
+  EXPECT_NE(error.find("start_index"), std::string::npos);
 }
 
 TEST_F(NpzTest, LoadNonExistentFile) {

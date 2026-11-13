@@ -23,3 +23,16 @@ float64 geometry_p95_m
 float64 correction_translation
 float64 correction_rotation
 builtin_interfaces/Time last_success_time
+string candidate_source
+string state_detail
+float64 last_trusted_pose_age_sec
+float64 manual_seed_time_remaining_sec
+uint32 map_point_count
+uint32 source_point_count
+float64 point_cloud_age_sec
+float64 tf_wait_sec
+float64 matching_duration_ms
+uint32 consecutive_failures
+uint32 pending_candidate_confirmations
+bool automatic_recovery_active
+float64 automatic_recovery_elapsed_sec

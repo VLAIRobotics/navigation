@@ -96,8 +96,6 @@ Clone the repository and colcon build:
     . ./install/setup.bash # use setup.zsh if use zsh
 ```
 - **Remember to source the livox_ros_driver before build (follow [1.3 livox_ros_driver](#1.3))**
-- If you want to use a custom build of PCL, add the following line to ~/.bashrc
-```export PCL_ROOT={CUSTOM_PCL_PATH}```
 ## 3. Directly run
 Noted:
 

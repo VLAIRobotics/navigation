@@ -18,10 +18,13 @@ find_package(PCL REQUIRED COMPONENTS common io filters)
 find_package(pcl_conversions REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_eigen REQUIRED)
+find_package(tf2_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(small_gicp REQUIRED)
 
@@ -34,6 +37,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 )
 
 find_package(OpenMP)
+find_package(Threads REQUIRED)
 
 add_executable(small_gicp_relocalization_node src/small_gicp_relocalization_node.cpp)
 target_include_directories(small_gicp_relocalization_node PRIVATE include ${PCL_INCLUDE_DIRS})
@@ -41,6 +45,7 @@ target_link_libraries(small_gicp_relocalization_node
   small_gicp::small_gicp
   ${PCL_LIBRARIES}
   Eigen3::Eigen
+  Threads::Threads
 )
 if(OpenMP_CXX_FOUND)
   target_link_libraries(small_gicp_relocalization_node OpenMP::OpenMP_CXX)
@@ -48,12 +53,15 @@ endif()
 ament_target_dependencies(small_gicp_relocalization_node
   builtin_interfaces
   geometry_msgs
+  nav_msgs
   pcl_conversions
   rclcpp
   sensor_msgs
   std_msgs
+  std_srvs
   tf2
   tf2_eigen
+  tf2_msgs
   tf2_ros
 )
 rosidl_target_interfaces(small_gicp_relocalization_node
@@ -97,8 +105,14 @@ if(BUILD_TESTING)
   ament_add_gtest(test_fastlio_health test/test_fastlio_health.cpp)
   target_include_directories(test_fastlio_health PRIVATE include)
 
+  ament_add_gtest(test_manual_seed_deadline test/test_manual_seed_deadline.cpp)
+  target_include_directories(test_manual_seed_deadline PRIVATE include)
+
   ament_add_gtest(test_relocalization_generation test/test_relocalization_generation.cpp)
   target_include_directories(test_relocalization_generation PRIVATE include)
+
+  ament_add_gtest(test_snapshot_storage test/test_snapshot_storage.cpp)
+  target_include_directories(test_snapshot_storage PRIVATE include)
 
   ament_add_gtest(test_registration_termination test/test_registration_termination.cpp)
   target_include_directories(test_registration_termination PRIVATE include)

@@ -43,8 +43,10 @@ GROUND_COMPONENT_HEIGHT_BAND="${GROUND_COMPONENT_HEIGHT_BAND:-0.35}"
 VISUALIZE="${VISUALIZE:-true}"
 CHASSIS_MODEL="${CHASSIS_MODEL:-two_wheel}"
 NAV2_PARAMS_FILE="${NAV2_PARAMS_FILE:-}"
-GICP_VISUALIZE="${GICP_VISUALIZE:-true}"
+GICP_VISUALIZE="${GICP_VISUALIZE:-false}"
 GICP_RVIZ_CONFIG="${GICP_RVIZ_CONFIG:-}"
+OFFLINE_SNAPSHOT_DIR="${OFFLINE_SNAPSHOT_DIR:-}"
+OFFLINE_SNAPSHOT_MAX_COUNT="${OFFLINE_SNAPSHOT_MAX_COUNT:-8}"
 CONFIG_FILE="${CONFIG_FILE:-mid360.yaml}"
 CONFIG_PATH="${CONFIG_PATH:-}"
 ENABLE_CHASSIS=true
@@ -126,7 +128,7 @@ usage() {
   CORE_RESTART_DELAY_SEC 定位 core 退出后重启前的等待时间，默认 2 s
   HANDOFF_READY_TIMEOUT_SEC transient-local 交接兜底等待时间，默认 20 s
   DISPLAY_PCD       true 时在 RViz 显示缓存三维 PCD，默认 true
-  GICP_VISUALIZE    定位阶段是否显示 GICP RViz，默认 true；首次交接后自动关闭
+  GICP_VISUALIZE    定位阶段是否显示 GICP RViz，默认 false
   GICP_RVIZ_CONFIG GICP 定位 RViz 配置，默认 bringup/rviz/gicp_relocalization.rviz
   CAPTURE_CORES     true 时为启动子进程设置 core size=unlimited；默认 false
   VISUALIZE         是否显示导航 RViz，默认 true；由 map_navigation.launch.py 启动
@@ -170,6 +172,8 @@ for argument in "$@"; do
     visualize:=*) VISUALIZE="${argument#visualize:=}" ;;
     gicp_visualize:=*) GICP_VISUALIZE="${argument#gicp_visualize:=}" ;;
     gicp_rviz_config:=*) GICP_RVIZ_CONFIG="${argument#gicp_rviz_config:=}" ;;
+    offline_snapshot_dir:=*) OFFLINE_SNAPSHOT_DIR="${argument#offline_snapshot_dir:=}" ;;
+    offline_snapshot_max_count:=*) OFFLINE_SNAPSHOT_MAX_COUNT="${argument#offline_snapshot_max_count:=}" ;;
     capture_cores:=*) CAPTURE_CORES="${argument#capture_cores:=}" ;;
     config_file:=*) CONFIG_FILE="${argument#config_file:=}" ;;
     config_path:=*) CONFIG_PATH="${argument#config_path:=}" ;;
@@ -191,8 +195,8 @@ for argument in "$@"; do
     handoff_max_rotation_speed_deg_s:=*) HANDOFF_MAX_ROTATION_SPEED_DEG_S="${argument#handoff_max_rotation_speed_deg_s:=}" ;;
     handoff_update_frequency_hz:=*) HANDOFF_UPDATE_FREQUENCY_HZ="${argument#handoff_update_frequency_hz:=}" ;;
     display_pcd:=*) DISPLAY_PCD="${argument#display_pcd:=}" ;;
-    map_yaml:=*|terrain_map_file:=*|display_pcd_file:=*)
-      echo "请使用 map_cache_dir:=；map_yaml、terrain_map_file 和 display_pcd_file 由缓存自动生成" >&2
+    map_yaml:=*|terrain_map_file:=*|display_pcd_file:=*|display_ground_cache_file:=*|display_structure_cache_file:=*)
+      echo "请使用 map_cache_dir:=；地图与显示缓存文件由脚本自动生成" >&2
       exit 2
       ;;
     -h|--help) usage; exit 0 ;;
@@ -211,7 +215,9 @@ for argument in "$@"; do
     min_inlier_ratio:=*|max_geometry_rmse_m:=*|max_geometry_p95_m:=*|stable_frames_required:=*|\
     stable_duration:=*|max_stable_translation_spread:=*|max_stable_yaw_spread:=*|min_match_sectors:=*|\
     require_multistart_consistency:=*|max_multistart_translation_spread:=*|max_multistart_yaw_spread:=*|\
-    validity_timeout:=*|max_consecutive_failures:=*|offline_snapshot_dir:=*|timing_log_period_ms:=*)
+    validity_timeout:=*|max_consecutive_failures:=*|offline_snapshot_max_count:=*|\
+    manual_seed_input_timeout_sec:=*|manual_seed_validation_timeout_sec:=*|\
+    manual_seed_bbs_height_max_age_sec:=*|timing_log_period_ms:=*)
       gicp_args+=("${argument}") ;;
     rviz_config:=*) RVIZ_CONFIG="${argument#rviz_config:=}" ;;
     *) nav_args+=("${argument}") ;;
@@ -219,15 +225,16 @@ for argument in "$@"; do
 done
 
 case "${CHASSIS_MODEL}" in
-  two_wheel|diff) ;;
+  two_wheel|diff)
+    CHASSIS_MODEL="two_wheel"
+    if [[ -z "${NAV2_PARAMS_FILE}" ]]; then
+      NAV2_PARAMS_FILE="${SCRIPT_DIR}/../src/bringup/config/nav2_map_navigation.yaml"
+    fi
+    ;;
   omni)
     if [[ -z "${NAV2_PARAMS_FILE}" ]]; then
-      NAV2_PARAMS_FILE="${SCRIPT_DIR}/../src/bringup/config/nav2_map_navigation_omni.yaml"
+      NAV2_PARAMS_FILE="${SCRIPT_DIR}/../src/bringup/config/nav2_map_navigation.yaml"
     fi
-    [[ -r "${NAV2_PARAMS_FILE}" ]] || {
-      echo "[!] Omni config not found: ${NAV2_PARAMS_FILE}" >&2
-      exit 2
-    }
     ;;
   *)
     echo "[!] Unsupported chassis_model '${CHASSIS_MODEL}'; use two_wheel or omni." >&2
@@ -243,6 +250,8 @@ fi
 if [[ -n "${NAV2_PARAMS_FILE}" && "${params_file_arg_seen}" == 0 ]]; then
   nav_args+=("params_file:=${NAV2_PARAMS_FILE}")
 fi
+nav_args+=("chassis_model:=${CHASSIS_MODEL}")
+echo "[*] Chassis model=${CHASSIS_MODEL}; Nav2 parameter source=${NAV2_PARAMS_FILE}"
 
 required_clearance_m="$(python3 - "${ROBOT_HEIGHT}" "${CLEARANCE_MARGIN}" <<'PYCODE'
 import math
@@ -350,11 +359,16 @@ fi
 
 terrain_map_file="${MAP_CACHE_DIR}/terrain_map.npz"
 display_pcd_file="${MAP_CACHE_DIR}/display_map.pcd"
+display_ground_cache_file="${MAP_CACHE_DIR}/display_map_ground_cache.pcd"
+display_structure_cache_file="${MAP_CACHE_DIR}/display_map_structure_index.bin"
 relocalization_pcd_file="${MAP_CACHE_DIR}/relocalization_map.pcd"
 map_yaml_file="${MAP_CACHE_DIR}/map.yaml"
 map_pgm_file="${MAP_CACHE_DIR}/map.pgm"
 stamp_file="${MAP_CACHE_DIR}/.source_stamp"
 lock_file="${MAP_CACHE_DIR}/.convert.lock"
+if [[ -z "${OFFLINE_SNAPSHOT_DIR}" ]]; then
+  OFFLINE_SNAPSHOT_DIR="${MAP_CACHE_DIR}/relocalization_snapshots"
+fi
 converter_prefix="$(ros2 pkg prefix bringup 2>/dev/null || true)"
 if [[ -z "${converter_prefix}" ]]; then
   echo "找不到 bringup 包；请先构建 bringup: colcon build --packages-select bringup --symlink-install" >&2
@@ -404,8 +418,9 @@ cache_validation_reason() {
   fi
   local missing=()
   local artifact
-  for artifact in "${terrain_map_file}" "${display_pcd_file}" "${relocalization_pcd_file}" \
-    "${map_yaml_file}" "${map_pgm_file}"; do
+  for artifact in "${terrain_map_file}" "${display_pcd_file}" \
+    "${display_ground_cache_file}" "${display_structure_cache_file}" \
+    "${relocalization_pcd_file}" "${map_yaml_file}" "${map_pgm_file}"; do
     if [[ ! -s "${artifact}" ]]; then
       missing+=("$(basename "${artifact}")")
     fi
@@ -434,7 +449,9 @@ cache_validation_reason() {
   fi
 }
 cache_invalidation_reason="$(cache_validation_reason)"
-if [[ "${REBUILD_MAP}" == false && -s "${terrain_map_file}" && -s "${display_pcd_file}" && -s "${relocalization_pcd_file}" && -s "${map_yaml_file}" && \
+if [[ "${REBUILD_MAP}" == false && -s "${terrain_map_file}" && -s "${display_pcd_file}" && \
+  -s "${display_ground_cache_file}" && -s "${display_structure_cache_file}" && \
+  -s "${relocalization_pcd_file}" && -s "${map_yaml_file}" && \
   -s "${map_pgm_file}" && -s "${stamp_file}" && "$(<"${stamp_file}")" == "${expected_stamp}" ]]; then
   cache_ready=true
 fi
@@ -450,7 +467,9 @@ else
   fi
   expected_stamp="$(make_stamp)"
   cache_invalidation_reason="$(cache_validation_reason)"
-  if [[ "${REBUILD_MAP}" == false && -s "${terrain_map_file}" && -s "${display_pcd_file}" && -s "${relocalization_pcd_file}" && -s "${map_yaml_file}" && \
+  if [[ "${REBUILD_MAP}" == false && -s "${terrain_map_file}" && -s "${display_pcd_file}" && \
+    -s "${display_ground_cache_file}" && -s "${display_structure_cache_file}" && \
+    -s "${relocalization_pcd_file}" && -s "${map_yaml_file}" && \
     -s "${map_pgm_file}" && -s "${stamp_file}" && "$(<"${stamp_file}")" == "${expected_stamp}" ]]; then
     echo "[*] Reusing cached 2.5D map after lock: ${MAP_CACHE_DIR} (reason=${cache_invalidation_reason})"
   else
@@ -468,9 +487,15 @@ else
       "--ground-component-height-band=${GROUND_COMPONENT_HEIGHT_BAND}" \
       "--display-pcd=${temp_dir}/display_map.pcd" \
       "--display-voxel-size=${DISPLAY_VOXEL_SIZE}" \
+      "--display-ground-cache=${temp_dir}/display_map_ground_cache.pcd" \
+      "--display-structure-cache=${temp_dir}/display_map_structure_index.bin" \
       "--relocalization-pcd=${temp_dir}/relocalization_map.pcd" \
       "--relocalization-voxel-size=${RELOCALIZATION_VOXEL_SIZE}"
-    [[ -s "${temp_dir}/terrain_map.npz" && -s "${temp_dir}/display_map.pcd" && -s "${temp_dir}/relocalization_map.pcd" && -s "${temp_dir}/map.yaml" && -s "${temp_dir}/map.pgm" ]] || {
+    [[ -s "${temp_dir}/terrain_map.npz" && -s "${temp_dir}/display_map.pcd" && \
+      -s "${temp_dir}/display_map_ground_cache.pcd" && \
+      -s "${temp_dir}/display_map_structure_index.bin" && \
+      -s "${temp_dir}/relocalization_map.pcd" && -s "${temp_dir}/map.yaml" && \
+      -s "${temp_dir}/map.pgm" ]] || {
       echo "terrain map converter did not produce all outputs" >&2
       exit 1
     }
@@ -480,6 +505,8 @@ else
     fi
     mv -f -- "${temp_dir}/terrain_map.npz" "${terrain_map_file}"
     mv -f -- "${temp_dir}/display_map.pcd" "${display_pcd_file}"
+    mv -f -- "${temp_dir}/display_map_ground_cache.pcd" "${display_ground_cache_file}"
+    mv -f -- "${temp_dir}/display_map_structure_index.bin" "${display_structure_cache_file}"
     mv -f -- "${temp_dir}/relocalization_map.pcd" "${relocalization_pcd_file}"
     mv -f -- "${temp_dir}/map.yaml" "${map_yaml_file}"
     mv -f -- "${temp_dir}/map.pgm" "${map_pgm_file}"
@@ -551,6 +578,12 @@ fi
 
 gicp_args+=(
   "pcd_file:=${relocalization_pcd_file}"
+  "navigation_map_file:=${terrain_map_file}"
+  "offline_snapshot_dir:=${OFFLINE_SNAPSHOT_DIR}"
+  "offline_snapshot_max_count:=${OFFLINE_SNAPSHOT_MAX_COUNT}"
+  "odometry_topic:=/Odometry"
+  "base_frame:=base_link"
+  "startup_context:=chassis_model=${CHASSIS_MODEL},nav2_params=${NAV2_PARAMS_FILE},pcd=${PCD_FILE},terrain=${terrain_map_file},body_to_base_x=${BODY_TO_BASE_X},body_to_base_y=${BODY_TO_BASE_Y},body_to_base_yaw=${BODY_TO_BASE_YAW}"
   "config_file:=${CONFIG_FILE}"
   "use_sim_time:=${USE_SIM_TIME}"
   "body_to_base_x:=${BODY_TO_BASE_X}"
@@ -606,6 +639,8 @@ fi
 nav_args+=("visualize:=${VISUALIZE}" "rviz_config:=${RVIZ_CONFIG}")
 if [[ "${DISPLAY_PCD}" == "true" ]]; then
   nav_args+=("display_pcd_file:=${display_pcd_file}")
+  nav_args+=("display_ground_cache_file:=${display_ground_cache_file}")
+  nav_args+=("display_structure_cache_file:=${display_structure_cache_file}")
 fi
 
 if [[ -n "${BODY_TO_BASE_ROLL}" ]]; then
