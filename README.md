@@ -1,22 +1,4 @@
 # navigation
-
-本仓库是 ROS 2 Humble 工作区，提供 FAST-LIO2、地面处理、高程地图和 Nav2 导航流程。
-
-## 现有问题
-
-### K1
-
-1. 首次启动时，全向 CAN 口参数尚未核对，方向和比例尚未验证，导致驱动退出，无法发送运动指令。导航仍继续运行，界面有路线也无法驱动车体。
-2. 从 L1 移植过来时，就存在移动时定位跳动或漂移的问题。
-3. 全向模式全局膨胀半径与足迹不匹配。
-4. 启动阶段 IMU 积压、断档及位姿保持。
-5. 最初版本因本机安装了不同的 Python 环境导致代码无法运行，可回退后重新进行重定位修改。
-
-### L1
-
-1. 重定位门控没有写好，有时定位会漂移。
-2. 障碍物逻辑存在问题，导致机器人走走停停。
-
 ## 获取代码
 
 已有代码且仓库根目录包含 `src/`、`tool/` 和 `README.md` 时，不需要重复克隆。
@@ -82,5 +64,5 @@ source install/setup.bash
 
 | 机器人 | 无图导航 | 已有 PCD 地图导航 |
 | --- | --- | --- |
-| L1（两轮） | `./tool/start_nav2.sh enable_chassis:=false` | `./tool/start_map_navigation.sh enable_chassis:=false` |
-| K1（全向） | `./tool/start_nav2.sh chassis_model:=omni enable_chassis:=false` | `./tool/start_map_navigation.sh chassis_model:=omni enable_chassis:=false` |
+| L1（两轮） | `./tool/start_nav2.sh ` | `./tool/start_map_navigation.sh ` |
+| K1（全向） | `./tool/start_nav2.sh chassis_model:=omni ` | `./tool/start_map_navigation.sh chassis_model:=omni ` |
